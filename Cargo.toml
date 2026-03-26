@@ -1,0 +1,37 @@
+[package]
+name = "prism"
+version = "0.1.0"
+edition = "2021"
+description = "Intelligent PR review TUI — manual, AI-assisted, or hybrid"
+
+[[bin]]
+name = "prism"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+octocrab = { version = "0.41", default-features = false, features = ["rustls", "rustls-webpki-tokio", "stream", "retry", "timeout"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+config = "0.14"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+syntect = "5"
+unicode-width = "0.1"
+textwrap = "0.16"
+async-trait = "0.1"
+indexmap = "2"
+
+[dev-dependencies]
+mockito = "1"
+tokio-test = "0.4"

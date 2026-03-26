@@ -1,0 +1,58 @@
+[github]
+token = ""
+owner = ""
+repo = ""
+per_page = 25
+
+[[tickets.providers]]
+type = "jira"
+enabled = true
+base_url = ""
+email = ""
+api_token = ""
+key_patterns = ["[A-Z]{2,10}-\\d+"]
+
+[[tickets.providers]]
+type = "linear"
+enabled = false
+api_key = ""
+key_patterns = ["[a-z]+-[0-9]+"]
+
+[llm]
+provider = "anthropic"
+model = "claude-opus-4-5"
+max_tokens = 4096
+temperature = 0.2
+
+[agents]
+agents_dir = "~/.config/prism/agents"
+concurrency = 3
+timeout_secs = 60
+diff_exclude_patterns = ["*.lock", "package-lock.json", "yarn.lock", "*.generated.*", "dist/*", "build/*"]
+max_diff_tokens = 8000
+
+[ui]
+theme = "dark"
+diff_context_lines = 5
+show_line_numbers = true
+highlight_syntax = true
+
+[ui.keybindings]
+quit = "q"
+back = "Esc"
+confirm = "Enter"
+next_pane = "Tab"
+prev_pane = "Shift+Tab"
+generate_review = "r"
+manual_comment = "c"
+publish = "p"
+toggle_item = "Space"
+select_all = "A"
+deselect_all = "D"
+open_browser = "o"
+refresh = "F5"
+search = "/"
+agent_config = "a"
+settings = "S"
+preview_summary = "P"
+check_file = "x"

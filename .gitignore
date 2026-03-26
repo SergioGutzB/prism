@@ -1,0 +1,27 @@
+# Build artifacts
+/target/
+
+# Environment variables (may contain secrets)
+.env
+.env.local
+.env.*.local
+
+# Claude Code local settings
+.claude/
+
+# Temporary files and dev docs
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+prism.log
