@@ -69,24 +69,29 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(t.background));
 
-    let text = if app.compose_text.is_empty() && !focused {
-        Span::styled(
+    let content: Vec<Line> = if app.compose_text.is_empty() && !focused {
+        vec![Line::from(Span::styled(
             "Press [i] to start writing your comment…",
             Style::default().fg(t.muted),
-        )
-        .into()
+        ))]
     } else {
-        // Show text with a cursor indicator in insert mode
         let mut display = app.compose_text.clone();
         if focused {
-            // Insert cursor block at cursor position
-            let pos = app.compose_cursor.min(display.len());
+            // Insert block cursor at byte position
+            let pos = (0..=app.compose_cursor.min(display.len()))
+                .rev()
+                .find(|&p| display.is_char_boundary(p))
+                .unwrap_or(0);
             display.insert(pos, '█');
         }
-        Line::from(display)
+        // Split on newlines so each line renders as a separate TUI line
+        display
+            .split('\n')
+            .map(|l| Line::from(l.to_string()))
+            .collect()
     };
 
-    let para = Paragraph::new(text)
+    let para = Paragraph::new(content)
         .block(block)
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(t.foreground).bg(t.background));

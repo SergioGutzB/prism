@@ -2,7 +2,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::App;
-use crate::ui::components::{diff_view, keybind_bar, ticket_panel};
+use crate::ui::components::{diff_view, keybind_bar, markdown, ticket_panel};
 use crate::ui::theme::Theme;
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -23,36 +23,46 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_header(frame, app, chunks[0], &t);
 
-    // Body: 2 or 3 column layout depending on whether we have a ticket
-    let has_ticket = app.current_ticket.is_some()
-        || app.config.tickets.providers.iter().any(|p| p.enabled);
-
-    if has_ticket {
-        // 3 columns: desc (30%) | diff (45%) | ticket (25%)
-        let body = Layout::horizontal([
-            Constraint::Percentage(30),
-            Constraint::Percentage(45),
-            Constraint::Percentage(25),
-        ])
-        .split(chunks[1]);
-        render_description(frame, app, body[0], &t);
-        render_diff_panel(frame, app, body[1], &t);
-        ticket_panel::render(frame, app, body[2], &t);
+    // Body: fullscreen diff, or 2/3 column layout
+    if app.diff_fullscreen {
+        render_diff_panel(frame, app, chunks[1], &t);
     } else {
-        // 2 columns: desc (35%) | diff (65%)
-        let body = Layout::horizontal([
-            Constraint::Percentage(35),
-            Constraint::Percentage(65),
-        ])
-        .split(chunks[1]);
-        render_description(frame, app, body[0], &t);
-        render_diff_panel(frame, app, body[1], &t);
+        let has_ticket = app.current_ticket.is_some()
+            || app.config.tickets.providers.iter().any(|p| p.enabled);
+
+        if has_ticket {
+            // 3 columns: desc (30%) | diff (45%) | ticket (25%)
+            let body = Layout::horizontal([
+                Constraint::Percentage(30),
+                Constraint::Percentage(45),
+                Constraint::Percentage(25),
+            ])
+            .split(chunks[1]);
+            render_description(frame, app, body[0], &t);
+            render_diff_panel(frame, app, body[1], &t);
+            ticket_panel::render(frame, app, body[2], &t);
+        } else {
+            // 2 columns: desc (35%) | diff (65%)
+            let body = Layout::horizontal([
+                Constraint::Percentage(35),
+                Constraint::Percentage(65),
+            ])
+            .split(chunks[1]);
+            render_description(frame, app, body[0], &t);
+            render_diff_panel(frame, app, body[1], &t);
+        }
     }
 
     let llm_hint = if app.config.is_llm_configured() {
         ("[r]", "AI Review")
     } else {
         ("[r]", "AI (unavail)")
+    };
+
+    let fullscreen_hint = if app.diff_fullscreen {
+        ("[z]", "Exit full")
+    } else {
+        ("[z]", "Full diff")
     };
 
     keybind_bar::render(
@@ -67,6 +77,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             ("[o]", "Browser"),
             ("[Tab]", "Pane"),
             ("[jk]", "Scroll"),
+            fullscreen_hint,
         ],
         &t,
     );
@@ -134,9 +145,11 @@ fn render_description(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .map(|pr| pr.body.as_str())
         .unwrap_or("No description.");
 
-    let para = Paragraph::new(body)
+    let md_lines = markdown::parse(body, t);
+    let para = Paragraph::new(md_lines)
         .block(block)
         .wrap(Wrap { trim: false })
+        .scroll((app.description_scroll, 0))
         .style(Style::default().fg(t.foreground).bg(t.background));
 
     frame.render_widget(para, area);

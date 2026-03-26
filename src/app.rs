@@ -113,8 +113,15 @@ pub struct App {
     // Screen history for back-navigation
     pub screen_stack: Vec<Screen>,
 
+    // Diff view options
+    /// When true, diff fills the full body area hiding description/ticket panels.
+    pub diff_fullscreen: bool,
+
     // Spinner tick counter (incremented on Tick events)
     pub tick: u64,
+
+    // File tree detail panel scroll
+    pub file_tree_scroll: u16,
 
     // Setup wizard state
     pub setup_gh_token: String,       // token detected from gh CLI
@@ -158,7 +165,9 @@ impl App {
             summary_event_idx: 1, // default: COMMENT
             agent_config_selected: 0,
             screen_stack: Vec::new(),
+            diff_fullscreen: false,
             tick: 0,
+            file_tree_scroll: 0,
             setup_gh_token: String::new(),
             setup_owner: String::new(),
             setup_repo: String::new(),
@@ -176,6 +185,13 @@ impl App {
         self.screen = next;
         self.key_detector.reset();
         self.selected_pane = 0;
+        // Reset screen-specific transient state
+        if matches!(self.screen, Screen::FileTree) {
+            self.file_tree_scroll = 0;
+        }
+        if !matches!(self.screen, Screen::PrDetail) {
+            self.diff_fullscreen = false;
+        }
     }
 
     /// Navigate back to the previous screen (if any).

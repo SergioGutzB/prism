@@ -134,6 +134,7 @@ pub enum Action {
     PreviewSummary,
     CheckFile,
     FileTree,
+    ToggleFullscreen,
     Delete,
     EnterInsert,
     ExitInsert,
@@ -207,6 +208,7 @@ pub fn map_key(key: &KeyEvent, mode: &InputMode) -> Option<Action> {
                 KeyCode::Char('x') => Some(Action::CheckFile),
                 KeyCode::Char('f') => Some(Action::FileTree),
                 KeyCode::Char('i') => Some(Action::EnterInsert),
+                KeyCode::Char('z') => Some(Action::ToggleFullscreen),
                 // Filter by agent number (1-7)
                 KeyCode::Char(c @ '1'..='7') => {
                     Some(Action::FilterAgent(c as u8 - b'0'))

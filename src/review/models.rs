@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
@@ -120,7 +120,7 @@ pub struct ReviewDraft {
     pub comments: Vec<GeneratedComment>,
     pub review_body: Option<String>,
     pub review_event: ReviewEvent,
-    pub file_checklist: HashMap<String, bool>,
+    pub file_checklist: IndexMap<String, bool>,
     pub mode: ReviewMode,
     /// When the review session was first started (for resume detection).
     pub started_at: chrono::DateTime<chrono::Utc>,
@@ -133,7 +133,7 @@ impl ReviewDraft {
             comments: Vec::new(),
             review_body: None,
             review_event: ReviewEvent::Comment,
-            file_checklist: HashMap::new(),
+            file_checklist: IndexMap::new(),
             mode,
             started_at: chrono::Utc::now(),
         }
@@ -166,6 +166,44 @@ impl ReviewDraft {
                 comment.status = CommentStatus::Approved;
             }
         }
+    }
+
+    /// Auto-generate a markdown summary body from approved comments.
+    pub fn generate_body(&self) -> String {
+        let approved = self.approved_comments();
+        if approved.is_empty() {
+            return "Review completed. No inline comments selected.".to_string();
+        }
+
+        let mut body = format!(
+            "## Review Summary\n\n{} comment(s) selected for this review.\n\n",
+            approved.len()
+        );
+
+        for sev in &[Severity::Critical, Severity::Warning, Severity::Suggestion, Severity::Praise] {
+            let group: Vec<_> = approved.iter().filter(|c| &c.severity == sev).collect();
+            if group.is_empty() {
+                continue;
+            }
+            let header = match sev {
+                Severity::Critical => "### Critical",
+                Severity::Warning => "### Warnings",
+                Severity::Suggestion => "### Suggestions",
+                Severity::Praise => "### Praise",
+            };
+            body.push_str(&format!("{}\n\n", header));
+            for c in group {
+                let location = match (&c.file_path, c.line) {
+                    (Some(f), Some(l)) => format!("`{}:{}` — ", f, l),
+                    (Some(f), None) => format!("`{}` — ", f),
+                    _ => String::new(),
+                };
+                body.push_str(&format!("- {}{}\n", location, c.effective_body()));
+            }
+            body.push('\n');
+        }
+
+        body
     }
 
     pub fn pending_count(&self) -> usize {

@@ -315,6 +315,13 @@ async fn handle_action(
         Action::NavDown => {
             match app.screen {
                 Screen::PrList => app.nav_down(),
+                Screen::FileTree => {
+                    let len = app.draft.as_ref().map(|d| d.file_checklist.len()).unwrap_or(0);
+                    if app.pr_list_selected + 1 < len {
+                        app.pr_list_selected += 1;
+                        app.file_tree_scroll = 0;
+                    }
+                }
                 Screen::DoubleCheck => {
                     let len = app.draft.as_ref().map(|d| d.comments.len()).unwrap_or(0);
                     if app.double_check_selected + 1 < len {
@@ -344,6 +351,12 @@ async fn handle_action(
                         app.double_check_selected -= 1;
                     }
                 }
+                Screen::FileTree => {
+                    if app.pr_list_selected > 0 {
+                        app.pr_list_selected -= 1;
+                        app.file_tree_scroll = 0;
+                    }
+                }
                 Screen::AgentConfig => {
                     if app.agent_config_selected > 0 {
                         app.agent_config_selected -= 1;
@@ -369,11 +382,19 @@ async fn handle_action(
         }
 
         Action::ScrollDown => {
-            app.diff_scroll = app.diff_scroll.saturating_add(10);
+            if app.screen == Screen::FileTree {
+                app.file_tree_scroll = app.file_tree_scroll.saturating_add(5);
+            } else {
+                app.diff_scroll = app.diff_scroll.saturating_add(10);
+            }
         }
 
         Action::ScrollUp => {
-            app.diff_scroll = app.diff_scroll.saturating_sub(10);
+            if app.screen == Screen::FileTree {
+                app.file_tree_scroll = app.file_tree_scroll.saturating_sub(5);
+            } else {
+                app.diff_scroll = app.diff_scroll.saturating_sub(10);
+            }
         }
 
         Action::PageDown => {
@@ -382,6 +403,12 @@ async fn handle_action(
 
         Action::PageUp => {
             app.diff_scroll = app.diff_scroll.saturating_sub(25);
+        }
+
+        Action::ToggleFullscreen => {
+            if app.screen == Screen::PrDetail {
+                app.diff_fullscreen = !app.diff_fullscreen;
+            }
         }
 
         Action::NextPane => {
@@ -395,6 +422,21 @@ async fn handle_action(
         Action::Confirm => match app.screen {
             Screen::PrList => {
                 open_pr(app, event_tx, config).await;
+            }
+            Screen::FileTree => {
+                // Jump to this file's section in the diff view
+                if let Some(draft) = &app.draft {
+                    if let Some(path) = draft.file_checklist.keys().nth(app.pr_list_selected).cloned() {
+                        if let Some(lines) = &app.diff_lines_cache {
+                            let target = format!("diff --git a/{} b/{}", path, path);
+                            if let Some(pos) = lines.iter().position(|l| l == &target) {
+                                app.diff_scroll = pos as u16;
+                            }
+                        }
+                        app.selected_pane = 1;
+                        app.navigate_back();
+                    }
+                }
             }
             Screen::ReviewCompose => {
                 if app.input_mode == InputMode::Insert {
@@ -559,6 +601,11 @@ async fn handle_action(
 
         Action::PreviewSummary => {
             if app.screen == Screen::DoubleCheck {
+                // Auto-generate review body from approved comments
+                if let Some(draft) = &mut app.draft {
+                    let body = draft.generate_body();
+                    draft.review_body = Some(body);
+                }
                 app.navigate_to(Screen::SummaryPreview);
             }
         }
