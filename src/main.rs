@@ -658,13 +658,16 @@ async fn open_pr(
         });
     }
 
-    // Load ticket (best-effort)
+    // Load ticket (best-effort) — search title + branch for ticket keys
     {
         let tx = event_tx.clone();
         let cfg = config.clone();
+        let pr_text = match app.selected_pr() {
+            Some(pr) => format!("{} {}", pr.title, pr.head_branch),
+            None => String::new(),
+        };
         tokio::spawn(async move {
-            // Try to extract ticket ref from PR title / branch — stub for now
-            let ticket = load_ticket_for_pr(&cfg, pr_num).await.ok().flatten();
+            let ticket = load_ticket_for_pr(&cfg, &pr_text).await;
             let _ = tx.send(AppEvent::TicketLoaded(ticket));
         });
     }
@@ -824,13 +827,23 @@ async fn load_pr_diff(
     api.get_pr_diff(pr_num).await
 }
 
+/// Extract ticket keys from the PR text and resolve the first match.
+/// Returns `None` silently on any error — ticket is always optional.
 async fn load_ticket_for_pr(
-    _config: &config::AppConfig,
-    _pr_num: u64,
-) -> anyhow::Result<Option<tickets::models::Ticket>> {
-    // Ticket loading is best-effort and provider-dependent.
-    // Returning None as a safe default for now.
-    Ok(None)
+    config: &config::AppConfig,
+    pr_text: &str,
+) -> Option<tickets::models::Ticket> {
+    let providers = tickets::build_providers(config);
+    if providers.is_empty() || pr_text.is_empty() {
+        return None;
+    }
+
+    let keys = tickets::extractor::extract_ticket_keys(pr_text, &providers);
+    if keys.is_empty() {
+        return None;
+    }
+
+    tickets::extractor::resolve_ticket(&keys, &providers).await
 }
 
 // ── Tracing init ───────────────────────────────────────────────────────────
