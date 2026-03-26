@@ -20,7 +20,7 @@ pub fn render_popup(frame: &mut Frame, app: &App) {
 
     let border_color = match popup.kind {
         PopupKind::Error => t.critical,
-        PopupKind::Confirm => t.warning,
+        PopupKind::Confirm | PopupKind::ConfirmQuit => t.warning,
         PopupKind::Info => t.border_focused,
     };
 
@@ -40,7 +40,7 @@ pub fn render_popup(frame: &mut Frame, app: &App) {
     frame.render_widget(block, popup_area);
 
     let hint = match popup.kind {
-        PopupKind::Confirm => "\n\n[Enter] Confirm  [Esc] Cancel",
+        PopupKind::Confirm | PopupKind::ConfirmQuit => "\n\n[Enter] Confirm  [Esc] Cancel",
         _ => "\n\n[Esc] Close",
     };
 

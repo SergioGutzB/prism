@@ -53,7 +53,13 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
 
     let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
     let filter_hint = match app.agent_filter {
-        Some(n) => format!(" [filter: agent {n}]"),
+        Some(n) => {
+            let name = app.agents
+                .get((n as usize).saturating_sub(1))
+                .map(|a| a.agent.name.as_str())
+                .unwrap_or("agent");
+            format!(" [filter: {name}]")
+        }
         None => String::new(),
     };
 

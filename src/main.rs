@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::{App, Screen};
+use crate::app::{App, PopupKind, PopupState, Screen};
 use crate::tui::event::{spawn_event_reader, AppEvent};
 use crate::tui::keybindings::{map_key, Action, InputMode, KeySequence};
 
@@ -242,7 +242,11 @@ fn handle_sequence(app: &mut App, seq: KeySequence) {
             }
         }
         KeySequence::ColonQuit => {
-            app.should_quit = true;
+            app.popup = Some(PopupState {
+                title: "Quit Prism".to_string(),
+                message: "Are you sure you want to quit?".to_string(),
+                kind: PopupKind::ConfirmQuit,
+            });
         }
         KeySequence::ColonWrite => {
             // Save / confirm depending on screen
@@ -260,7 +264,14 @@ async fn handle_action(
     // If a popup is open, only allow closing it
     if app.popup.is_some() {
         match action {
-            Action::Quit | Action::Back | Action::Confirm | Action::ExitInsert => {
+            Action::Confirm => {
+                let is_quit = app.popup.as_ref().map(|p| p.kind == PopupKind::ConfirmQuit).unwrap_or(false);
+                app.dismiss_popup();
+                if is_quit {
+                    app.should_quit = true;
+                }
+            }
+            Action::Quit | Action::Back | Action::ExitInsert => {
                 app.dismiss_popup();
             }
             _ => {}
@@ -276,7 +287,11 @@ async fn handle_action(
 
     match action {
         Action::Quit => {
-            app.should_quit = true;
+            app.popup = Some(PopupState {
+                title: "Quit Prism".to_string(),
+                message: "Are you sure you want to quit?".to_string(),
+                kind: PopupKind::ConfirmQuit,
+            });
         }
 
         Action::Back => {
@@ -311,11 +326,6 @@ async fn handle_action(
                         app.agent_config_selected += 1;
                     }
                 }
-                Screen::SummaryPreview => {
-                    if app.summary_event_idx + 1 < 3 {
-                        app.summary_event_idx += 1;
-                    }
-                }
                 Screen::PrDetail => {
                     match app.selected_pane {
                         0 => app.description_scroll = app.description_scroll.saturating_add(3),
@@ -337,11 +347,6 @@ async fn handle_action(
                 Screen::AgentConfig => {
                     if app.agent_config_selected > 0 {
                         app.agent_config_selected -= 1;
-                    }
-                }
-                Screen::SummaryPreview => {
-                    if app.summary_event_idx > 0 {
-                        app.summary_event_idx -= 1;
                     }
                 }
                 Screen::PrDetail => {
@@ -449,6 +454,24 @@ async fn handle_action(
 
         Action::FileTree => {
             if matches!(app.screen, Screen::PrDetail | Screen::ReviewCompose) {
+                // Parse changed files from diff and populate checklist
+                let diff_files: Vec<String> = if let Some(diff) = &app.current_diff {
+                    diff.lines()
+                        .filter(|l| l.starts_with("diff --git "))
+                        .filter_map(|l| l.split(" b/").nth(1).map(str::to_string))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if !diff_files.is_empty() {
+                    let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
+                    let draft = app.draft.get_or_insert_with(|| {
+                        review::models::ReviewDraft::new(pr_num, review::models::ReviewMode::ManualOnly)
+                    });
+                    for f in diff_files {
+                        draft.file_checklist.entry(f).or_insert(false);
+                    }
+                }
                 app.navigate_to(Screen::FileTree);
             }
         }
@@ -611,8 +634,16 @@ async fn handle_action(
             }
         }
 
-        Action::NavLeft | Action::NavRight => {
-            // Not yet implemented
+        Action::NavLeft => {
+            if app.screen == Screen::SummaryPreview && app.summary_event_idx > 0 {
+                app.summary_event_idx -= 1;
+            }
+        }
+
+        Action::NavRight => {
+            if app.screen == Screen::SummaryPreview && app.summary_event_idx + 1 < 3 {
+                app.summary_event_idx += 1;
+            }
         }
     }
 }
@@ -794,6 +825,22 @@ fn start_agent_runner(app: &mut App, config: &config::AppConfig) {
     use agents::context::ReviewContext;
     use agents::orchestrator::Orchestrator;
     use review::models::{ReviewDraft, ReviewMode};
+
+    // If a previous review exists with comments, resume it instead of re-running agents
+    if let Some(draft) = &app.draft {
+        if !draft.comments.is_empty() {
+            let n = draft.comments.len();
+            let date = draft.started_at
+                .format("%Y-%m-%d %H:%M UTC")
+                .to_string();
+            app.show_info(
+                "Resuming Review",
+                format!("Previous review started {date}\n{n} comment(s) found — resuming without re-running agents."),
+            );
+            app.navigate_to(Screen::DoubleCheck);
+            return;
+        }
+    }
 
     let pr = match &app.current_pr {
         Some(pr) => pr.clone(),

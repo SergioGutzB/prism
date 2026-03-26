@@ -51,6 +51,8 @@ pub enum PopupKind {
     Info,
     Error,
     Confirm,
+    /// Requires Enter to confirm quit, Esc to cancel.
+    ConfirmQuit,
 }
 
 /// Global application state — all mutable state lives here.

@@ -46,7 +46,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         chunks[3],
         &[
             ("[Esc]", "Back"),
-            ("[jk]", "Select event"),
+            ("[←→]", "Review type"),
             ("[Enter]", "Publish"),
             ("[q]", "Abort"),
         ],

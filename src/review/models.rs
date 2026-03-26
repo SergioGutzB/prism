@@ -122,6 +122,8 @@ pub struct ReviewDraft {
     pub review_event: ReviewEvent,
     pub file_checklist: HashMap<String, bool>,
     pub mode: ReviewMode,
+    /// When the review session was first started (for resume detection).
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl ReviewDraft {
@@ -133,6 +135,7 @@ impl ReviewDraft {
             review_event: ReviewEvent::Comment,
             file_checklist: HashMap::new(),
             mode,
+            started_at: chrono::Utc::now(),
         }
     }
 
