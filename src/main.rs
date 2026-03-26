@@ -77,6 +77,16 @@ async fn main() -> Result<()> {
             }
         });
     } else {
+        // Try to auto-detect credentials from gh CLI
+        let gh_token = config::AppConfig::gh_token();
+        if let Some(token) = gh_token {
+            let (owner, repo) = config::AppConfig::gh_current_repo()
+                .unwrap_or_default();
+            app.setup_gh_token = token;
+            app.setup_owner = owner;
+            app.setup_repo = repo;
+        }
+        app.screen = Screen::Setup;
         app.pr_list_loading = false;
     }
 
@@ -178,6 +188,30 @@ async fn main() -> Result<()> {
             AppEvent::PublishFailed(msg) => {
                 app.show_error(format!("Publish failed: {}", msg));
             }
+
+            AppEvent::SetupSaved(token, owner, repo) => {
+                // Reload config with the new credentials and start normally
+                app.setup_saving = false;
+                app.config.github.token = token;
+                app.config.github.owner = owner.clone();
+                app.config.github.repo = repo.clone();
+                app.screen = Screen::PrList;
+                app.pr_list_loading = true;
+
+                let tx = event_tx.clone();
+                let cfg = app.config.clone();
+                tokio::spawn(async move {
+                    match load_pr_list(&cfg).await {
+                        Ok(prs) => { let _ = tx.send(AppEvent::PrListLoaded(prs)); }
+                        Err(e) => { let _ = tx.send(AppEvent::Error(format!("Failed to load PRs: {e}"))); }
+                    }
+                });
+            }
+
+            AppEvent::SetupFailed(msg) => {
+                app.setup_saving = false;
+                app.show_error(format!("Could not save config: {}", msg));
+            }
         }
     }
 
@@ -228,6 +262,12 @@ async fn handle_action(
             }
             _ => {}
         }
+        return;
+    }
+
+    // Setup wizard intercepts all input
+    if app.screen == Screen::Setup {
+        handle_setup_action(app, action, event_tx).await;
         return;
     }
 
@@ -565,6 +605,71 @@ async fn handle_action(
         Action::NavLeft | Action::NavRight => {
             // Not yet implemented
         }
+    }
+}
+
+async fn handle_setup_action(
+    app: &mut App,
+    action: Action,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    use app::SetupField;
+
+    match action {
+        Action::Quit | Action::Back => {
+            app.should_quit = true;
+        }
+
+        // Tab: switch between Owner and Repo fields
+        Action::NextPane | Action::PrevPane => {
+            app.setup_field = match app.setup_field {
+                SetupField::Owner => SetupField::Repo,
+                SetupField::Repo  => SetupField::Owner,
+            };
+        }
+
+        // Enter: confirm and save
+        Action::Confirm => {
+            if app.setup_owner.trim().is_empty() || app.setup_repo.trim().is_empty() {
+                app.show_error("Owner and repository name cannot be empty.");
+                return;
+            }
+            app.setup_saving = true;
+
+            let token = app.setup_gh_token.clone();
+            let owner = app.setup_owner.trim().to_string();
+            let repo  = app.setup_repo.trim().to_string();
+            let tx    = event_tx.clone();
+
+            tokio::spawn(async move {
+                match config::AppConfig::save_github_config(&token, &owner, &repo) {
+                    Ok(()) => {
+                        let _ = tx.send(AppEvent::SetupSaved(token, owner, repo));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::SetupFailed(format!("{:#}", e)));
+                    }
+                }
+            });
+        }
+
+        // Typing: update the focused field
+        Action::Char(c) => {
+            match app.setup_field {
+                SetupField::Owner => app.setup_owner.push(c),
+                SetupField::Repo  => app.setup_repo.push(c),
+            }
+        }
+
+        // Backspace
+        Action::Delete => {
+            match app.setup_field {
+                SetupField::Owner => { app.setup_owner.pop(); }
+                SetupField::Repo  => { app.setup_repo.pop(); }
+            }
+        }
+
+        _ => {}
     }
 }
 

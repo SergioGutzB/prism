@@ -20,6 +20,10 @@ pub enum AppEvent {
     Error(String),
     PublishDone,
     PublishFailed(String),
+    /// Emitted when setup wizard saves config successfully.
+    /// Carries (token, owner, repo) so main can reload and start.
+    SetupSaved(String, String, String),
+    SetupFailed(String),
 }
 
 /// Spawn a background thread that polls crossterm events and sends them

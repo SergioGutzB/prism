@@ -1,4 +1,5 @@
 pub mod agent_config;
+pub mod setup;
 pub mod agent_runner;
 pub mod double_check;
 pub mod file_tree;

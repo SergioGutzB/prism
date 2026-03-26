@@ -185,6 +185,63 @@ impl AppConfig {
             .map(|s| s.success())
             .unwrap_or(false)
     }
+
+    /// Try to get a GitHub token from the `gh` CLI (`gh auth token`).
+    pub fn gh_token() -> Option<String> {
+        let out = std::process::Command::new("gh")
+            .args(["auth", "token"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let token = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        if token.is_empty() { None } else { Some(token) }
+    }
+
+    /// Try to detect owner/repo from the current git remote via `gh repo view`.
+    pub fn gh_current_repo() -> Option<(String, String)> {
+        let out = std::process::Command::new("gh")
+            .args(["repo", "view", "--json", "owner,name"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        let owner = v["owner"]["login"].as_str()?.to_string();
+        let name  = v["name"].as_str()?.to_string();
+        Some((owner, name))
+    }
+
+    /// Persist GitHub credentials to `~/.config/prism/config.toml`.
+    /// Creates the file if it doesn't exist; merges with existing content.
+    pub fn save_github_config(token: &str, owner: &str, repo: &str) -> anyhow::Result<()> {
+        let path = dirs_user_config();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+
+        // Read existing TOML (if any) so we don't lose other settings
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut doc: toml::Table = existing.parse().unwrap_or_default();
+
+        let github = doc
+            .entry("github")
+            .or_insert(toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .cloned()
+            .unwrap_or_default();
+
+        let mut gh = github;
+        gh.insert("token".into(), toml::Value::String(token.to_string()));
+        gh.insert("owner".into(), toml::Value::String(owner.to_string()));
+        gh.insert("repo".into(),  toml::Value::String(repo.to_string()));
+        doc.insert("github".into(), toml::Value::Table(gh));
+
+        std::fs::write(&path, toml::to_string_pretty(&doc)?)?;
+        Ok(())
+    }
 }
 
 fn dirs_user_config() -> PathBuf {

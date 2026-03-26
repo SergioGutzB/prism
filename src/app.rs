@@ -13,6 +13,7 @@ use crate::tui::keybindings::{InputMode, KeySequenceDetector};
 /// Which screen the TUI is showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
+    Setup,   // First-run wizard when GitHub is not configured
     PrList,
     PrDetail,
     FileTree,
@@ -28,6 +29,13 @@ impl Default for Screen {
     fn default() -> Self {
         Self::PrList
     }
+}
+
+/// Which field is focused in the Setup wizard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupField {
+    Owner,
+    Repo,
 }
 
 /// A popup that can overlay any screen.
@@ -98,6 +106,13 @@ pub struct App {
 
     // Spinner tick counter (incremented on Tick events)
     pub tick: u64,
+
+    // Setup wizard state
+    pub setup_gh_token: String,       // token detected from gh CLI
+    pub setup_owner: String,          // editable owner field
+    pub setup_repo: String,           // editable repo field
+    pub setup_field: SetupField,      // which field is focused
+    pub setup_saving: bool,           // true while saving to disk
 }
 
 impl App {
@@ -132,6 +147,11 @@ impl App {
             agent_config_selected: 0,
             screen_stack: Vec::new(),
             tick: 0,
+            setup_gh_token: String::new(),
+            setup_owner: String::new(),
+            setup_repo: String::new(),
+            setup_field: SetupField::Owner,
+            setup_saving: false,
         }
     }
 

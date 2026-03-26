@@ -7,12 +7,13 @@ use ratatui::Frame;
 use crate::app::App;
 use crate::ui::screens::{
     agent_config, agent_runner, double_check, file_tree, pr_detail, pr_list, review_compose,
-    summary_preview,
+    setup, summary_preview,
 };
 
 /// Top-level render dispatch — pure function, never modifies App.
 pub fn render(frame: &mut Frame, app: &App) {
     match &app.screen {
+        crate::app::Screen::Setup => setup::render(frame, app),
         crate::app::Screen::PrList => pr_list::render(frame, app),
         crate::app::Screen::PrDetail => pr_detail::render(frame, app),
         crate::app::Screen::FileTree => file_tree::render(frame, app),
