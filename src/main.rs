@@ -166,6 +166,18 @@ async fn main() -> Result<()> {
                 app.pr_loading = false;
                 app.show_error(msg);
             }
+
+            AppEvent::PublishDone => {
+                app.show_info("Published", "Review submitted to GitHub successfully.");
+                // Clear draft and go back to PR list
+                app.draft = None;
+                app.screen_stack.clear();
+                app.screen = Screen::PrList;
+            }
+
+            AppEvent::PublishFailed(msg) => {
+                app.show_error(format!("Publish failed: {}", msg));
+            }
         }
     }
 
@@ -343,7 +355,7 @@ async fn handle_action(
                 }
             }
             Screen::SummaryPreview => {
-                app.set_status("Publishing… (not yet implemented)");
+                publish_review(app, event_tx, config).await;
             }
             Screen::DoubleCheck => {
                 // Toggle approve/reject
@@ -544,7 +556,13 @@ async fn handle_action(
             }
         }
 
-        Action::NavLeft | Action::NavRight | Action::Publish => {
+        Action::Publish => {
+            if app.screen == Screen::SummaryPreview {
+                publish_review(app, event_tx, config).await;
+            }
+        }
+
+        Action::NavLeft | Action::NavRight => {
             // Not yet implemented
         }
     }
@@ -721,6 +739,57 @@ fn toggle_comment(app: &mut App) {
             };
         }
     }
+}
+
+// ── Publish ────────────────────────────────────────────────────────────────
+
+async fn publish_review(
+    app: &mut App,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+    config: &config::AppConfig,
+) {
+    use review::models::ReviewEvent;
+
+    let draft = match &mut app.draft {
+        Some(d) => d,
+        None => {
+            app.show_error("No review draft to publish.");
+            return;
+        }
+    };
+
+    // Sync the selected review event from the radio selector
+    let selected_event = match app.summary_event_idx {
+        0 => ReviewEvent::Comment,
+        1 => ReviewEvent::RequestChanges,
+        _ => ReviewEvent::Approve,
+    };
+    draft.review_event = selected_event;
+
+    // Clone what we need before spawning
+    let draft_clone = draft.clone();
+    let tx = event_tx.clone();
+    let cfg = config.clone();
+
+    app.set_status("Publishing review…");
+
+    tokio::spawn(async move {
+        let result = async {
+            let api = make_github_api(&cfg)?;
+            let publisher = review::publisher::ReviewPublisher::new(api);
+            publisher.publish(&draft_clone).await
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                let _ = tx.send(AppEvent::PublishDone);
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::PublishFailed(format!("{:#}", e)));
+            }
+        }
+    });
 }
 
 // ── GitHub API calls ───────────────────────────────────────────────────────

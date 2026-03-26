@@ -18,6 +18,8 @@ pub enum AppEvent {
     DiffLoaded(String),
     TicketLoaded(Option<Ticket>),
     Error(String),
+    PublishDone,
+    PublishFailed(String),
 }
 
 /// Spawn a background thread that polls crossterm events and sends them
