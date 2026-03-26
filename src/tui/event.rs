@@ -11,7 +11,8 @@ use crate::tickets::models::Ticket;
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
-    Tick,
+    // Note: Tick is NOT sent through this channel.
+    // Rendering is driven by a fixed tokio::time::interval in main.
     AgentUpdate(AgentUpdate),
     PrListLoaded(Vec<PrSummary>),
     PrLoaded(Box<PrDetails>),
@@ -26,27 +27,25 @@ pub enum AppEvent {
     SetupFailed(String),
 }
 
-/// Spawn a background thread that polls crossterm events and sends them
-/// through the channel at 16ms tick rate (~60fps).
+/// Spawn a background thread that polls crossterm key events.
+/// Only key events are sent — rendering is driven by a separate tokio interval.
 pub fn spawn_event_reader(tx: mpsc::UnboundedSender<AppEvent>) {
     std::thread::spawn(move || {
-        let tick = Duration::from_millis(16);
+        // Poll with a short timeout so we never block the thread indefinitely.
+        let poll_timeout = Duration::from_millis(5);
         loop {
-            if event::poll(tick).unwrap_or(false) {
-                match event::read() {
+            match event::poll(poll_timeout) {
+                Ok(true) => match event::read() {
                     Ok(Event::Key(key)) => {
                         if tx.send(AppEvent::Key(key)).is_err() {
                             break;
                         }
                     }
-                    Ok(_) => {} // Mouse, resize, paste — ignore for now
+                    Ok(_) => {} // mouse, resize, paste — ignore
                     Err(_) => break,
-                }
-            } else {
-                // Tick
-                if tx.send(AppEvent::Tick).is_err() {
-                    break;
-                }
+                },
+                Ok(false) => {} // no event — loop and poll again
+                Err(_) => break,
             }
         }
     });

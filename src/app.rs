@@ -68,8 +68,15 @@ pub struct App {
     // Current PR state
     pub current_pr: Option<PrDetails>,
     pub current_diff: Option<String>,
+    /// Pre-split diff lines — rebuilt only when current_diff changes.
+    /// Stored as raw strings; colorization happens in render (O(visible only)).
+    pub diff_lines_cache: Option<Vec<String>>,
     pub current_ticket: Option<Ticket>,
     pub pr_loading: bool,
+    /// True while the diff is being fetched (independent of pr_loading).
+    pub diff_loading: bool,
+    /// Scroll offset for the Description panel (pane 0).
+    pub description_scroll: u16,
 
     // Review draft
     pub draft: Option<ReviewDraft>,
@@ -127,8 +134,11 @@ impl App {
             pr_list_filter: String::new(),
             current_pr: None,
             current_diff: None,
+            diff_lines_cache: None,
             current_ticket: None,
             pr_loading: false,
+            diff_loading: false,
+            description_scroll: 0,
             draft: None,
             agent_statuses: HashMap::new(),
             agent_rx: None,

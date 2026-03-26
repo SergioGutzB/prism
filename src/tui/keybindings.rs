@@ -156,10 +156,14 @@ pub fn map_key(key: &KeyEvent, mode: &InputMode) -> Option<Action> {
             _ => None,
         },
         InputMode::Normal => {
-            // Ctrl-C always quits
+            // Ctrl combos
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 return match key.code {
                     KeyCode::Char('c') => Some(Action::Quit),
+                    KeyCode::Char('d') => Some(Action::ScrollDown),
+                    KeyCode::Char('u') => Some(Action::ScrollUp),
+                    KeyCode::Char('f') => Some(Action::PageDown),
+                    KeyCode::Char('b') => Some(Action::PageUp),
                     _ => None,
                 };
             }

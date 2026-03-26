@@ -91,126 +91,129 @@ async fn main() -> Result<()> {
     }
 
     // ── Main event loop ────────────────────────────────────────────────────
+    // Render at a fixed 16ms (~60fps) independently of incoming events.
+    // Events are processed as soon as they arrive via tokio::select!.
+    let mut render_ticker = tokio::time::interval(std::time::Duration::from_millis(16));
+    render_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
-        // Drain any pending agent updates from the mpsc receiver
-        // We must collect first to avoid borrow conflict
-        let agent_updates: Vec<_> = if let Some(rx) = &mut app.agent_rx {
-            let mut updates = Vec::new();
-            while let Ok(update) = rx.try_recv() {
-                updates.push(update);
+        tokio::select! {
+            biased; // prefer events over render ticks to stay responsive
+
+            // ── Incoming async events ──────────────────────────────────────
+            maybe_event = event_rx.recv() => {
+                let event = match maybe_event {
+                    Some(e) => e,
+                    None => break,
+                };
+                match event {
+                    AppEvent::Key(key_event) => {
+                        if app.input_mode == InputMode::Normal {
+                            if let Some(seq) = app.key_detector.feed(&key_event) {
+                                handle_sequence(&mut app, seq);
+                                if app.should_quit { break; }
+                                continue;
+                            }
+                        }
+                        if let Some(action) = map_key(&key_event, &app.input_mode) {
+                            handle_action(&mut app, action, &event_tx, &config).await;
+                        }
+                        if app.should_quit { break; }
+                    }
+
+                    AppEvent::PrListLoaded(prs) => {
+                        info!("PR list loaded: {} PRs", prs.len());
+                        app.pr_list = prs;
+                        app.pr_list_loading = false;
+                        if app.pr_list.is_empty() {
+                            app.set_status("No open PRs found.");
+                        }
+                    }
+
+                    AppEvent::PrLoaded(pr) => {
+                        info!("PR #{} loaded", pr.number);
+                        app.current_pr = Some(*pr);
+                        app.pr_loading = false;
+                    }
+
+                    AppEvent::DiffLoaded(diff) => {
+                        info!("Diff loaded ({} chars)", diff.len());
+                        // Pre-split lines so render only colorizes the visible slice
+                        app.diff_lines_cache = Some(
+                            diff.lines().map(str::to_string).collect()
+                        );
+                        app.current_diff = Some(diff);
+                        app.diff_loading = false;
+                    }
+
+                    AppEvent::TicketLoaded(ticket) => {
+                        info!("Ticket loaded: {}", ticket.is_some());
+                        app.current_ticket = ticket;
+                    }
+
+                    AppEvent::AgentUpdate(update) => {
+                        handle_agent_update(&mut app, update);
+                    }
+
+                    AppEvent::Error(msg) => {
+                        app.pr_list_loading = false;
+                        app.pr_loading = false;
+                        app.diff_loading = false;
+                        app.show_error(msg);
+                    }
+
+                    AppEvent::PublishDone => {
+                        app.show_info("Published", "Review submitted to GitHub successfully.");
+                        app.draft = None;
+                        app.screen_stack.clear();
+                        app.screen = Screen::PrList;
+                    }
+
+                    AppEvent::PublishFailed(msg) => {
+                        app.show_error(format!("Publish failed: {}", msg));
+                    }
+
+                    AppEvent::SetupSaved(token, owner, repo) => {
+                        app.setup_saving = false;
+                        app.config.github.token = token;
+                        app.config.github.owner = owner.clone();
+                        app.config.github.repo = repo.clone();
+                        app.screen = Screen::PrList;
+                        app.pr_list_loading = true;
+                        let tx = event_tx.clone();
+                        let cfg = app.config.clone();
+                        tokio::spawn(async move {
+                            match load_pr_list(&cfg).await {
+                                Ok(prs) => { let _ = tx.send(AppEvent::PrListLoaded(prs)); }
+                                Err(e) => { let _ = tx.send(AppEvent::Error(format!("Failed to load PRs: {e}"))); }
+                            }
+                        });
+                    }
+
+                    AppEvent::SetupFailed(msg) => {
+                        app.setup_saving = false;
+                        app.show_error(format!("Could not save config: {}", msg));
+                    }
+                }
             }
-            updates
-        } else {
-            Vec::new()
-        };
-        for update in agent_updates {
-            handle_agent_update(&mut app, update);
-        }
 
-        // Render
-        terminal.draw(|frame| {
-            ui::render(frame, &app);
-        })?;
-
-        // Wait for the next event
-        let event = match event_rx.recv().await {
-            Some(e) => e,
-            None => break,
-        };
-
-        match event {
-            AppEvent::Tick => {
+            // ── Render tick (60fps) ────────────────────────────────────────
+            _ = render_ticker.tick() => {
                 app.tick = app.tick.wrapping_add(1);
-            }
 
-            AppEvent::Key(key_event) => {
-                // Feed the key sequence detector first (only in Normal mode)
-                if app.input_mode == InputMode::Normal {
-                    if let Some(seq) = app.key_detector.feed(&key_event) {
-                        handle_sequence(&mut app, seq);
-                        continue;
-                    }
+                // Drain agent updates (non-blocking)
+                let agent_updates: Vec<_> = if let Some(rx) = &mut app.agent_rx {
+                    let mut updates = Vec::new();
+                    while let Ok(u) = rx.try_recv() { updates.push(u); }
+                    updates
+                } else {
+                    Vec::new()
+                };
+                for update in agent_updates {
+                    handle_agent_update(&mut app, update);
                 }
 
-                // Map key → action
-                if let Some(action) = map_key(&key_event, &app.input_mode) {
-                    handle_action(&mut app, action, &event_tx, &config).await;
-                }
-
-                if app.should_quit {
-                    break;
-                }
-            }
-
-            AppEvent::PrListLoaded(prs) => {
-                info!("PR list loaded: {} PRs", prs.len());
-                app.pr_list = prs;
-                app.pr_list_loading = false;
-                if app.pr_list.is_empty() {
-                    app.set_status("No open PRs found.");
-                }
-            }
-
-            AppEvent::PrLoaded(pr) => {
-                info!("PR #{} loaded", pr.number);
-                app.current_pr = Some(*pr);
-                app.pr_loading = false;
-            }
-
-            AppEvent::DiffLoaded(diff) => {
-                info!("Diff loaded ({} chars)", diff.len());
-                app.current_diff = Some(diff);
-            }
-
-            AppEvent::TicketLoaded(ticket) => {
-                info!("Ticket loaded: {}", ticket.is_some());
-                app.current_ticket = ticket;
-            }
-
-            AppEvent::AgentUpdate(update) => {
-                handle_agent_update(&mut app, update);
-            }
-
-            AppEvent::Error(msg) => {
-                app.pr_list_loading = false;
-                app.pr_loading = false;
-                app.show_error(msg);
-            }
-
-            AppEvent::PublishDone => {
-                app.show_info("Published", "Review submitted to GitHub successfully.");
-                // Clear draft and go back to PR list
-                app.draft = None;
-                app.screen_stack.clear();
-                app.screen = Screen::PrList;
-            }
-
-            AppEvent::PublishFailed(msg) => {
-                app.show_error(format!("Publish failed: {}", msg));
-            }
-
-            AppEvent::SetupSaved(token, owner, repo) => {
-                // Reload config with the new credentials and start normally
-                app.setup_saving = false;
-                app.config.github.token = token;
-                app.config.github.owner = owner.clone();
-                app.config.github.repo = repo.clone();
-                app.screen = Screen::PrList;
-                app.pr_list_loading = true;
-
-                let tx = event_tx.clone();
-                let cfg = app.config.clone();
-                tokio::spawn(async move {
-                    match load_pr_list(&cfg).await {
-                        Ok(prs) => { let _ = tx.send(AppEvent::PrListLoaded(prs)); }
-                        Err(e) => { let _ = tx.send(AppEvent::Error(format!("Failed to load PRs: {e}"))); }
-                    }
-                });
-            }
-
-            AppEvent::SetupFailed(msg) => {
-                app.setup_saving = false;
-                app.show_error(format!("Could not save config: {}", msg));
+                terminal.draw(|frame| ui::render(frame, &app))?;
             }
         }
     }
@@ -314,7 +317,10 @@ async fn handle_action(
                     }
                 }
                 Screen::PrDetail => {
-                    app.diff_scroll = app.diff_scroll.saturating_add(3);
+                    match app.selected_pane {
+                        0 => app.description_scroll = app.description_scroll.saturating_add(3),
+                        _ => app.diff_scroll = app.diff_scroll.saturating_add(3),
+                    }
                 }
                 _ => {}
             }
@@ -339,7 +345,10 @@ async fn handle_action(
                     }
                 }
                 Screen::PrDetail => {
-                    app.diff_scroll = app.diff_scroll.saturating_sub(3);
+                    match app.selected_pane {
+                        0 => app.description_scroll = app.description_scroll.saturating_sub(3),
+                        _ => app.diff_scroll = app.diff_scroll.saturating_sub(3),
+                    }
                 }
                 _ => {}
             }
@@ -724,9 +733,12 @@ async fn open_pr(
 
     app.current_pr = None;
     app.current_diff = None;
+    app.diff_lines_cache = None;
     app.current_ticket = None;
     app.pr_loading = true;
+    app.diff_loading = true;
     app.diff_scroll = 0;
+    app.description_scroll = 0;
     app.selected_pane = 1;
 
     app.navigate_to(Screen::PrDetail);
