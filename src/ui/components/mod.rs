@@ -1,6 +1,7 @@
 pub mod agent_status;
 pub mod comment_card;
 pub mod markdown;
+pub mod syntax;
 pub mod diff_view;
 pub mod editor;
 pub mod file_checklist;

@@ -2,27 +2,45 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::App;
+use crate::ui::components::syntax;
 use crate::ui::theme::Theme;
 
-/// Colorize a single diff line. Called only for visible lines.
-fn colorize_line(raw: &str, t: &Theme) -> Line<'static> {
-    let line = raw.to_string();
-    let style = if line.starts_with("@@") {
-        Style::default().fg(t.diff_hunk)
-    } else if line.starts_with('+') && !line.starts_with("+++") {
-        Style::default().fg(t.diff_add)
-    } else if line.starts_with('-') && !line.starts_with("---") {
-        Style::default().fg(t.diff_remove)
-    } else if line.starts_with("diff ")
-        || line.starts_with("index ")
-        || line.starts_with("---")
-        || line.starts_with("+++")
+/// Colorize a single diff line with syntax highlighting. Called only for visible lines.
+fn colorize_line(raw: &str, ext: Option<&str>, t: &Theme) -> Line<'static> {
+    // Header lines: no syntax
+    if raw.starts_with("@@") {
+        return Line::from(Span::styled(raw.to_string(), Style::default().fg(t.diff_hunk)));
+    }
+    if raw.starts_with("diff ") || raw.starts_with("index ")
+        || raw.starts_with("---") || raw.starts_with("+++")
     {
-        Style::default().fg(t.title)
-    } else {
-        Style::default().fg(t.diff_context)
-    };
-    Line::from(Span::styled(line, style))
+        return Line::from(Span::styled(raw.to_string(), Style::default().fg(t.title)));
+    }
+    // Added line: green fg prefix + syntax highlighted code with subtle green bg
+    if raw.starts_with('+') {
+        let code = &raw[1..];
+        let bg = Color::Rgb(20, 48, 20);
+        let mut spans = vec![Span::styled("+".to_string(), Style::default().fg(t.diff_add).bg(bg))];
+        spans.extend(syntax::highlight(code, ext, Some(bg)));
+        return Line::from(spans);
+    }
+    // Removed line: red fg prefix + syntax highlighted code with subtle red bg
+    if raw.starts_with('-') {
+        let code = &raw[1..];
+        let bg = Color::Rgb(48, 20, 20);
+        let mut spans = vec![Span::styled("-".to_string(), Style::default().fg(t.diff_remove).bg(bg))];
+        spans.extend(syntax::highlight(code, ext, Some(bg)));
+        return Line::from(spans);
+    }
+    // Context line: syntax highlighted code, no bg
+    if raw.starts_with(' ') {
+        let code = &raw[1..];
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(syntax::highlight(code, ext, None));
+        return Line::from(spans);
+    }
+    // Fallback
+    Line::from(Span::styled(raw.to_string(), Style::default().fg(t.diff_context)))
 }
 
 /// Render the diff panel using the pre-split line cache.
@@ -78,14 +96,20 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, t: &Theme, focused: bool
 
     // Clamp scroll so we never go past the last line
     let max_scroll = total.saturating_sub(inner.height as usize);
-    let scroll = (app.diff_scroll as usize).min(max_scroll);
+    let scroll = app.diff_scroll.min(max_scroll);
 
     // Only colorize the visible slice — O(height) instead of O(total)
     let visible: Vec<Line> = lines
         .iter()
         .skip(scroll)
+        .zip(
+            app.diff_line_ext
+                .iter()
+                .skip(scroll)
+                .chain(std::iter::repeat(&None)),
+        )
         .take(inner.height as usize)
-        .map(|raw| colorize_line(raw, t))
+        .map(|(raw, ext)| colorize_line(raw, ext.as_deref(), t))
         .collect();
 
     frame.render_widget(

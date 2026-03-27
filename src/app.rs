@@ -78,7 +78,7 @@ pub struct App {
     /// True while the diff is being fetched (independent of pr_loading).
     pub diff_loading: bool,
     /// Scroll offset for the Description panel (pane 0).
-    pub description_scroll: u16,
+    pub description_scroll: usize,
 
     // Review draft
     pub draft: Option<ReviewDraft>,
@@ -92,7 +92,7 @@ pub struct App {
     pub input_mode: InputMode,
     pub key_detector: KeySequenceDetector,
     pub selected_pane: usize,
-    pub diff_scroll: u16,
+    pub diff_scroll: usize,
     pub should_quit: bool,
     pub status_message: Option<String>,
     pub popup: Option<PopupState>,
@@ -121,7 +121,19 @@ pub struct App {
     pub tick: u64,
 
     // File tree detail panel scroll
-    pub file_tree_scroll: u16,
+    pub file_tree_scroll: usize,
+
+    // File tree pane state
+    pub file_tree_pane: u8,            // 0 = file list, 1 = detail panel
+    pub file_tree_line: usize,         // selected line in detail panel
+
+    // Inline comment state
+    pub compose_file_path: Option<String>,  // file for inline comment
+    pub compose_line: Option<u32>,          // line for inline comment
+    pub compose_context: Vec<String>,       // surrounding diff lines for context
+
+    // Per-diff-line precomputed file extension for syntax highlighting
+    pub diff_line_ext: Vec<Option<String>>,
 
     // Setup wizard state
     pub setup_gh_token: String,       // token detected from gh CLI
@@ -168,6 +180,12 @@ impl App {
             diff_fullscreen: false,
             tick: 0,
             file_tree_scroll: 0,
+            file_tree_pane: 0,
+            file_tree_line: 0,
+            compose_file_path: None,
+            compose_line: None,
+            compose_context: Vec::new(),
+            diff_line_ext: Vec::new(),
             setup_gh_token: String::new(),
             setup_owner: String::new(),
             setup_repo: String::new(),
@@ -188,6 +206,8 @@ impl App {
         // Reset screen-specific transient state
         if matches!(self.screen, Screen::FileTree) {
             self.file_tree_scroll = 0;
+            self.file_tree_pane = 0;
+            self.file_tree_line = 0;
         }
         if !matches!(self.screen, Screen::PrDetail) {
             self.diff_fullscreen = false;

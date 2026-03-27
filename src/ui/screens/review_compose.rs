@@ -3,7 +3,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::App;
 use crate::tui::keybindings::InputMode;
-use crate::ui::components::keybind_bar;
+use crate::ui::components::{keybind_bar, syntax};
 use crate::ui::theme::Theme;
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -15,17 +15,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         area,
     );
 
-    let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(0),
-        Constraint::Length(3),
-        Constraint::Length(3),
-    ])
-    .split(area);
-
-    render_header(frame, app, chunks[0], &t);
-    render_editor(frame, app, chunks[1], &t);
-    render_mode_indicator(frame, app, chunks[2], &t);
+    let has_context = app.compose_file_path.is_some() && !app.compose_context.is_empty();
 
     let hint = if app.input_mode == InputMode::Insert {
         &[("[Esc]", "Normal mode"), ("[Enter]", "New line")][..]
@@ -38,12 +28,89 @@ pub fn render(frame: &mut Frame, app: &App) {
         ][..]
     };
 
-    keybind_bar::render(frame, chunks[3], hint, &t);
+    if has_context {
+        let context_height = (app.compose_context.len() as u16 + 2).min(10);
+        let chunks = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(context_height),
+            Constraint::Min(0),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+        render_header(frame, app, chunks[0], &t);
+        render_context(frame, app, chunks[1], &t);
+        render_editor(frame, app, chunks[2], &t);
+        render_mode_indicator(frame, app, chunks[3], &t);
+        keybind_bar::render(frame, chunks[4], hint, &t);
+    } else {
+        let chunks = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+        render_header(frame, app, chunks[0], &t);
+        render_editor(frame, app, chunks[1], &t);
+        render_mode_indicator(frame, app, chunks[2], &t);
+        keybind_bar::render(frame, chunks[3], hint, &t);
+    }
+}
+
+fn render_context(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
+    let file_path = app.compose_file_path.as_deref().unwrap_or("");
+    let line_num = app.compose_line.map(|l| l.to_string()).unwrap_or_else(|| "?".to_string());
+    let ext = file_path.rsplit('.').next();
+
+    let title = format!(" Context: {}:{} ", file_path, line_num);
+    let block = Block::default()
+        .title(title.as_str())
+        .title_style(Style::default().fg(t.suggestion))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.suggestion))
+        .style(Style::default().bg(t.background));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let context_len = app.compose_context.len();
+    let lines: Vec<Line> = app.compose_context.iter().enumerate().map(|(i, raw)| {
+        // Highlight the selected line (middle of context)
+        let is_target = i == context_len / 2;
+
+        let diff_char = raw.chars().next().unwrap_or(' ');
+        let code = if raw.len() > 1 { &raw[1..] } else { "" };
+
+        let (diff_color, bg) = match diff_char {
+            '+' => (t.diff_add, Some(Color::Rgb(20, 48, 20))),
+            '-' => (t.diff_remove, Some(Color::Rgb(48, 20, 20))),
+            _ => (t.diff_context, None),
+        };
+
+        let effective_bg = if is_target { Some(Color::Rgb(40, 40, 0)) } else { bg };
+
+        let mut spans = vec![Span::styled(
+            diff_char.to_string(),
+            Style::default().fg(diff_color),
+        )];
+        spans.extend(syntax::highlight(code, ext, effective_bg));
+        Line::from(spans)
+    }).collect();
+
+    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(t.background)), inner);
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
-    let title = format!(" Compose Comment — PR #{pr_num} ");
+    let location = match (&app.compose_file_path, app.compose_line) {
+        (Some(f), Some(l)) => format!(" — {}:{}", f, l),
+        (Some(f), None) => format!(" — {}", f),
+        _ => String::new(),
+    };
+    let title = format!(" Compose Comment — PR #{pr_num}{location} ");
     let block = Block::default()
         .title(title.as_str())
         .title_style(Style::default().fg(t.title).add_modifier(Modifier::BOLD))

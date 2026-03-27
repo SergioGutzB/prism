@@ -3,7 +3,7 @@ use ratatui::widgets::{Block, Borders, Cell, Gauge, List, ListItem, ListState, P
 
 use crate::app::App;
 use crate::review::models::{CommentSource, CommentStatus, Severity};
-use crate::ui::components::{diff_view, keybind_bar};
+use crate::ui::components::{diff_view, keybind_bar, syntax};
 use crate::ui::theme::Theme;
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -36,19 +36,32 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_detail(frame, app, body[1], &t);
 
     render_progress(frame, app, chunks[2], &t);
-    keybind_bar::render(
-        frame,
-        chunks[3],
-        &[
-            ("[Esc]", "Back"),
-            ("[jk]", "Navigate"),
-            ("[Enter]", "Jump to diff"),
-            ("[x]", "Toggle check"),
-            ("[A/D]", "Check/Uncheck all"),
-            ("[J/K]", "Scroll detail"),
-        ],
-        &t,
-    );
+    if app.file_tree_pane == 0 {
+        keybind_bar::render(
+            frame,
+            chunks[3],
+            &[
+                ("[Esc]", "Back"),
+                ("[jk]", "Navigate files"),
+                ("[Enter]", "Jump to diff"),
+                ("[→]", "View detail"),
+                ("[x]", "Toggle check"),
+            ],
+            &t,
+        );
+    } else {
+        keybind_bar::render(
+            frame,
+            chunks[3],
+            &[
+                ("[←]", "Back to files"),
+                ("[jk]", "Navigate lines"),
+                ("[c]", "Comment line"),
+                ("[J/K]", "Scroll detail"),
+            ],
+            &t,
+        );
+    }
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
@@ -190,13 +203,29 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     // Diff section
     let diff_lines = extract_file_diff_lines(app, path);
     let total = diff_lines.len();
-    let scroll = (app.file_tree_scroll as usize).min(total.saturating_sub(1));
+    let ext = path.rsplit('.').next();
 
+    // Compute effective scroll — auto-scroll to keep file_tree_line visible
+    let show_cursor = app.file_tree_pane == 1;
+    let effective_scroll = if show_cursor {
+        let visible_h = detail_chunks[0].height.saturating_sub(2) as usize; // subtract border
+        if app.file_tree_line >= app.file_tree_scroll + visible_h {
+            app.file_tree_line + 1 - visible_h
+        } else if app.file_tree_line < app.file_tree_scroll {
+            app.file_tree_line
+        } else {
+            app.file_tree_scroll
+        }
+    } else {
+        app.file_tree_scroll.min(total.saturating_sub(1))
+    };
+
+    let border_color = if show_cursor { t.border_focused } else { t.border };
     let block = Block::default()
         .title(format!(" {} ", path))
         .title_style(Style::default().fg(t.title))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border))
+        .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(t.background));
 
     let inner = block.inner(detail_chunks[0]);
@@ -211,9 +240,20 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     } else {
         let visible: Vec<Line> = diff_lines
             .iter()
-            .skip(scroll)
+            .enumerate()
+            .skip(effective_scroll)
             .take(inner.height as usize)
-            .map(|raw| colorize_diff_line(raw, t))
+            .map(|(abs_idx, raw)| {
+                let is_selected = show_cursor && abs_idx == app.file_tree_line;
+                let line = colorize_diff_line_with_syntax(raw, ext, t);
+                if is_selected {
+                    Line::from(line.spans.into_iter().map(|s| {
+                        Span::styled(s.content, s.style.bg(t.selected_bg).fg(t.selected_fg))
+                    }).collect::<Vec<_>>())
+                } else {
+                    line
+                }
+            })
             .collect();
         frame.render_widget(
             Paragraph::new(visible).style(Style::default().bg(t.background)),
@@ -222,7 +262,7 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
 
         // Scroll indicator
         if total > inner.height as usize {
-            let indicator = format!(" {}/{} ", scroll + 1, total);
+            let indicator = format!(" {}/{} ", effective_scroll + 1, total);
             let ind_w = indicator.len() as u16;
             let ind_area = Rect {
                 x: detail_chunks[0].right().saturating_sub(ind_w + 1),
@@ -333,24 +373,36 @@ fn extract_file_diff_lines(app: &App, path: &str) -> Vec<String> {
     result
 }
 
-fn colorize_diff_line(raw: &str, t: &Theme) -> Line<'static> {
-    let line = raw.to_string();
-    let style = if line.starts_with("@@") {
-        Style::default().fg(t.diff_hunk)
-    } else if line.starts_with('+') && !line.starts_with("+++") {
-        Style::default().fg(t.diff_add)
-    } else if line.starts_with('-') && !line.starts_with("---") {
-        Style::default().fg(t.diff_remove)
-    } else if line.starts_with("diff ")
-        || line.starts_with("index ")
-        || line.starts_with("---")
-        || line.starts_with("+++")
+fn colorize_diff_line_with_syntax(raw: &str, ext: Option<&str>, t: &Theme) -> Line<'static> {
+    if raw.starts_with("@@") {
+        return Line::from(Span::styled(raw.to_string(), Style::default().fg(t.diff_hunk)));
+    }
+    if raw.starts_with("diff ") || raw.starts_with("index ")
+        || raw.starts_with("---") || raw.starts_with("+++")
     {
-        Style::default().fg(t.title)
-    } else {
-        Style::default().fg(t.diff_context)
-    };
-    Line::from(Span::styled(line, style))
+        return Line::from(Span::styled(raw.to_string(), Style::default().fg(t.title)));
+    }
+    if raw.starts_with('+') {
+        let code = &raw[1..];
+        let bg = Color::Rgb(20, 48, 20);
+        let mut spans = vec![Span::styled("+".to_string(), Style::default().fg(t.diff_add).bg(bg))];
+        spans.extend(syntax::highlight(code, ext, Some(bg)));
+        return Line::from(spans);
+    }
+    if raw.starts_with('-') {
+        let code = &raw[1..];
+        let bg = Color::Rgb(48, 20, 20);
+        let mut spans = vec![Span::styled("-".to_string(), Style::default().fg(t.diff_remove).bg(bg))];
+        spans.extend(syntax::highlight(code, ext, Some(bg)));
+        return Line::from(spans);
+    }
+    if raw.starts_with(' ') {
+        let code = &raw[1..];
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(syntax::highlight(code, ext, None));
+        return Line::from(spans);
+    }
+    Line::from(Span::styled(raw.to_string(), Style::default().fg(t.diff_context)))
 }
 
 fn shorten_path(path: &str) -> String {

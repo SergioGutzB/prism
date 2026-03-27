@@ -47,7 +47,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         &[
             ("[Esc]", "Back"),
             ("[←→]", "Review type"),
-            ("[Enter]", "Publish"),
+            ("[Enter/p]", "Submit to GitHub"),
             ("[q]", "Abort"),
         ],
         &t,
@@ -77,7 +77,7 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .draft
         .as_ref()
         .and_then(|d| d.review_body.as_deref())
-        .unwrap_or("(No review body)");
+        .unwrap_or("(Press [P] from Double-Check to generate the review summary from your approved comments.)");
 
     let para = Paragraph::new(body)
         .block(
@@ -165,7 +165,7 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
 
 fn render_event_selector(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let block = Block::default()
-        .title(" Review Type ")
+        .title(" Review Type — choose what kind of GitHub review to submit ")
         .title_style(Style::default().fg(t.title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.border_focused))

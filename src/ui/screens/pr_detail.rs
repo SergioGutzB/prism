@@ -149,7 +149,7 @@ fn render_description(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let para = Paragraph::new(md_lines)
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((app.description_scroll, 0))
+        .scroll((app.description_scroll as u16, 0))
         .style(Style::default().fg(t.foreground).bg(t.background));
 
     frame.render_widget(para, area);

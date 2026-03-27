@@ -142,6 +142,19 @@ async fn main() -> Result<()> {
                         app.diff_lines_cache = Some(
                             diff.lines().map(str::to_string).collect()
                         );
+                        // Precompute file extension for each diff line (used for syntax highlighting)
+                        let diff_line_ext = {
+                            let mut current_ext: Option<String> = None;
+                            diff.lines().map(|line| {
+                                if line.starts_with("diff --git ") {
+                                    current_ext = line.split(" b/").nth(1)
+                                        .and_then(|p| p.rsplit('.').next())
+                                        .map(|s| s.to_string());
+                                }
+                                current_ext.clone()
+                            }).collect()
+                        };
+                        app.diff_line_ext = diff_line_ext;
                         app.current_diff = Some(diff);
                         app.diff_loading = false;
                     }
@@ -316,10 +329,22 @@ async fn handle_action(
             match app.screen {
                 Screen::PrList => app.nav_down(),
                 Screen::FileTree => {
-                    let len = app.draft.as_ref().map(|d| d.file_checklist.len()).unwrap_or(0);
-                    if app.pr_list_selected + 1 < len {
-                        app.pr_list_selected += 1;
-                        app.file_tree_scroll = 0;
+                    if app.file_tree_pane == 1 {
+                        // Move line selection in detail panel
+                        let file_count = app.draft.as_ref()
+                            .and_then(|d| d.file_checklist.keys().nth(app.pr_list_selected))
+                            .map(|path| count_file_diff_lines(app, path))
+                            .unwrap_or(0);
+                        if app.file_tree_line + 1 < file_count {
+                            app.file_tree_line += 1;
+                        }
+                    } else {
+                        let len = app.draft.as_ref().map(|d| d.file_checklist.len()).unwrap_or(0);
+                        if app.pr_list_selected + 1 < len {
+                            app.pr_list_selected += 1;
+                            app.file_tree_scroll = 0;
+                            app.file_tree_line = 0;
+                        }
                     }
                 }
                 Screen::DoubleCheck => {
@@ -336,7 +361,10 @@ async fn handle_action(
                 Screen::PrDetail => {
                     match app.selected_pane {
                         0 => app.description_scroll = app.description_scroll.saturating_add(3),
-                        _ => app.diff_scroll = app.diff_scroll.saturating_add(3),
+                        _ => {
+                            let max_lines = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
+                            app.diff_scroll = (app.diff_scroll + 3).min(max_lines);
+                        }
                     }
                 }
                 _ => {}
@@ -352,9 +380,16 @@ async fn handle_action(
                     }
                 }
                 Screen::FileTree => {
-                    if app.pr_list_selected > 0 {
-                        app.pr_list_selected -= 1;
-                        app.file_tree_scroll = 0;
+                    if app.file_tree_pane == 1 {
+                        if app.file_tree_line > 0 {
+                            app.file_tree_line -= 1;
+                        }
+                    } else {
+                        if app.pr_list_selected > 0 {
+                            app.pr_list_selected -= 1;
+                            app.file_tree_scroll = 0;
+                            app.file_tree_line = 0;
+                        }
                     }
                 }
                 Screen::AgentConfig => {
@@ -385,7 +420,8 @@ async fn handle_action(
             if app.screen == Screen::FileTree {
                 app.file_tree_scroll = app.file_tree_scroll.saturating_add(5);
             } else {
-                app.diff_scroll = app.diff_scroll.saturating_add(10);
+                let max_lines = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
+                app.diff_scroll = (app.diff_scroll + 10).min(max_lines);
             }
         }
 
@@ -398,7 +434,8 @@ async fn handle_action(
         }
 
         Action::PageDown => {
-            app.diff_scroll = app.diff_scroll.saturating_add(25);
+            let max_lines = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
+            app.diff_scroll = (app.diff_scroll + 25).min(max_lines);
         }
 
         Action::PageUp => {
@@ -430,7 +467,7 @@ async fn handle_action(
                         if let Some(lines) = &app.diff_lines_cache {
                             let target = format!("diff --git a/{} b/{}", path, path);
                             if let Some(pos) = lines.iter().position(|l| l == &target) {
-                                app.diff_scroll = pos as u16;
+                                app.diff_scroll = pos;
                             }
                         }
                         app.selected_pane = 1;
@@ -490,7 +527,31 @@ async fn handle_action(
             if app.screen == Screen::PrDetail {
                 app.compose_text.clear();
                 app.compose_cursor = 0;
+                app.compose_file_path = None;
+                app.compose_line = None;
+                app.compose_context.clear();
                 app.navigate_to(Screen::ReviewCompose);
+            } else if app.screen == Screen::FileTree && app.file_tree_pane == 1 {
+                // Get selected file and line for inline comment
+                if let Some(path) = app.draft.as_ref()
+                    .and_then(|d| d.file_checklist.keys().nth(app.pr_list_selected))
+                    .cloned()
+                {
+                    let diff_lines = extract_file_diff_for_compose(app, &path);
+                    let actual_line = get_diff_line_number(&diff_lines, app.file_tree_line);
+
+                    // Collect context: 3 lines before and after selected
+                    let start = app.file_tree_line.saturating_sub(3);
+                    let end = (app.file_tree_line + 4).min(diff_lines.len());
+                    let context: Vec<String> = diff_lines[start..end].to_vec();
+
+                    app.compose_file_path = Some(path);
+                    app.compose_line = actual_line;
+                    app.compose_context = context;
+                    app.compose_text.clear();
+                    app.compose_cursor = 0;
+                    app.navigate_to(Screen::ReviewCompose);
+                }
             }
         }
 
@@ -684,12 +745,17 @@ async fn handle_action(
         Action::NavLeft => {
             if app.screen == Screen::SummaryPreview && app.summary_event_idx > 0 {
                 app.summary_event_idx -= 1;
+            } else if app.screen == Screen::FileTree && app.file_tree_pane == 1 {
+                app.file_tree_pane = 0;
             }
         }
 
         Action::NavRight => {
             if app.screen == Screen::SummaryPreview && app.summary_event_idx + 1 < 3 {
                 app.summary_event_idx += 1;
+            } else if app.screen == Screen::FileTree && app.file_tree_pane == 0 {
+                app.file_tree_pane = 1;
+                app.file_tree_line = 0;
             }
         }
     }
@@ -921,6 +987,59 @@ fn start_agent_runner(app: &mut App, config: &config::AppConfig) {
     app.agent_rx = Some(rx);
 }
 
+fn count_file_diff_lines(app: &App, path: &str) -> usize {
+    app.current_diff.as_deref().map(|diff| {
+        let target = format!("diff --git a/{} b/{}", path, path);
+        let mut count = 0;
+        let mut found = false;
+        for line in diff.lines() {
+            if line == target { found = true; continue; }
+            if found && line.starts_with("diff --git ") { break; }
+            if found { count += 1; }
+        }
+        count
+    }).unwrap_or(0)
+}
+
+fn extract_file_diff_for_compose(app: &App, path: &str) -> Vec<String> {
+    app.current_diff.as_deref().map(|diff| {
+        let target = format!("diff --git a/{} b/{}", path, path);
+        let mut result = Vec::new();
+        let mut found = false;
+        for line in diff.lines() {
+            if line == target { found = true; }
+            else if found && line.starts_with("diff --git ") { break; }
+            if found { result.push(line.to_string()); }
+        }
+        result
+    }).unwrap_or_default()
+}
+
+/// Compute the actual source line number for a given visual line index in a file diff.
+fn get_diff_line_number(diff_lines: &[String], line_idx: usize) -> Option<u32> {
+    let mut hunk_start: Option<u32> = None;
+    let mut offset: u32 = 0;
+
+    for (i, line) in diff_lines.iter().enumerate() {
+        if line.starts_with("@@ ") {
+            // Parse "+start" from "@@ -a,b +start,len @@"
+            hunk_start = line.split('+').nth(1)
+                .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|s| s.parse::<u32>().ok());
+            offset = 0;
+            if i == line_idx { return hunk_start; }
+        } else if hunk_start.is_some() {
+            if i == line_idx {
+                return hunk_start.map(|s| s + offset.saturating_sub(1));
+            }
+            if !line.starts_with('-') {
+                offset += 1;
+            }
+        }
+    }
+    None
+}
+
 fn save_compose_comment(app: &mut App) {
     use review::models::{CommentSource, GeneratedComment, ReviewDraft, ReviewMode, Severity};
     let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
@@ -932,15 +1051,22 @@ fn save_compose_comment(app: &mut App) {
             CommentSource::Manual,
             app.compose_text.clone(),
             Severity::Suggestion,
-            None,
-            None,
+            app.compose_file_path.clone(),
+            app.compose_line,
         );
         if let Some(draft) = &mut app.draft {
             draft.add_comment(comment);
+            // Add to file_checklist if file not already there
+            if let Some(ref path) = app.compose_file_path {
+                draft.file_checklist.entry(path.clone()).or_insert(false);
+            }
         }
     }
     app.compose_text.clear();
     app.compose_cursor = 0;
+    app.compose_file_path = None;
+    app.compose_line = None;
+    app.compose_context.clear();
 }
 
 fn toggle_comment(app: &mut App) {
