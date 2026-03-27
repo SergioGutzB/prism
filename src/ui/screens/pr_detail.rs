@@ -1,5 +1,5 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 
 use crate::app::App;
 use crate::ui::components::{diff_view, keybind_bar, markdown, ticket_panel};
@@ -65,6 +65,13 @@ pub fn render(frame: &mut Frame, app: &App) {
         ("[z]", "Full diff")
     };
 
+    let review_count = app.draft.as_ref().map(|d| d.comments.len()).unwrap_or(0);
+    let reviews_label: String = if review_count > 0 {
+        format!("Reviews({})", review_count)
+    } else {
+        "Reviews".to_string()
+    };
+
     keybind_bar::render(
         frame,
         chunks[2],
@@ -72,12 +79,14 @@ pub fn render(frame: &mut Frame, app: &App) {
             ("[Esc]", "Back"),
             llm_hint,
             ("[c]", "Comment"),
+            ("[v]", reviews_label.as_str()),
             ("[H]", "Hybrid"),
             ("[f]", "Files"),
             ("[o]", "Browser"),
             ("[Tab]", "Pane"),
             ("[jk]", "Scroll"),
             fullscreen_hint,
+            ("[?]", "Help"),
         ],
         &t,
     );
@@ -145,6 +154,7 @@ fn render_description(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .map(|pr| pr.body.as_str())
         .unwrap_or("No description.");
 
+    let total_lines = body.lines().count();
     let md_lines = markdown::parse(body, t);
     let para = Paragraph::new(md_lines)
         .block(block)
@@ -153,6 +163,21 @@ fn render_description(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .style(Style::default().fg(t.foreground).bg(t.background));
 
     frame.render_widget(para, area);
+
+    // Vertical scrollbar for description
+    if total_lines > area.height as usize {
+        let max_s = total_lines.saturating_sub(area.height as usize);
+        let mut sb_state = ScrollbarState::new(max_s).position(app.description_scroll.min(max_s));
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .thumb_symbol("█")
+                .track_symbol(Some("│")),
+            area,
+            &mut sb_state,
+        );
+    }
 }
 
 fn render_diff_panel(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {

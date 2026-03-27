@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::{App, PopupKind, PopupState, Screen};
+use crate::app::{App, PendingPublish, PopupKind, PopupState, Screen};
 use crate::tui::event::{spawn_event_reader, AppEvent};
 use crate::tui::keybindings::{map_key, Action, InputMode, KeySequence};
 
@@ -76,6 +76,19 @@ async fn main() -> Result<()> {
                 }
             }
         });
+
+        // Fetch current authenticated user
+        {
+            let tx = event_tx.clone();
+            let cfg = config.clone();
+            tokio::spawn(async move {
+                if let Ok(api) = make_github_api(&cfg) {
+                    if let Ok(login) = api.get_current_user().await {
+                        let _ = tx.send(AppEvent::UserLoaded(login));
+                    }
+                }
+            });
+        }
     } else {
         // Try to auto-detect credentials from gh CLI
         let gh_token = config::AppConfig::gh_token();
@@ -183,7 +196,79 @@ async fn main() -> Result<()> {
                     }
 
                     AppEvent::PublishFailed(msg) => {
-                        app.show_error(format!("Publish failed: {}", msg));
+                        let display = if msg.contains("request changes on your own pull request") {
+                            "Cannot request changes on your own PR. Change review type to 'Comment' or 'Approve'.".to_string()
+                        } else {
+                            format!("Publish failed: {}", msg)
+                        };
+                        app.show_error(display);
+                    }
+
+                    AppEvent::UserLoaded(login) => {
+                        app.github_user = Some(login);
+                    }
+
+                    AppEvent::ReviewsLoaded(reviews, comments) => {
+                        use review::models::{CommentSource, CommentStatus, GeneratedComment, Severity};
+                        let draft = app.draft.get_or_insert_with(|| {
+                            let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
+                            review::models::ReviewDraft::new(pr_num, review::models::ReviewMode::ManualOnly)
+                        });
+
+                        // Add existing reviews as comments (only non-empty body reviews)
+                        for review in &reviews {
+                            if review.body.trim().is_empty() { continue; }
+                            let severity = match review.state.as_str() {
+                                "CHANGES_REQUESTED" => Severity::Warning,
+                                "APPROVED" => Severity::Praise,
+                                _ => Severity::Suggestion,
+                            };
+                            let mut comment = GeneratedComment::new(
+                                CommentSource::Agent {
+                                    agent_id: format!("gh_review_{}", review.id),
+                                    agent_name: format!("@{}", review.user.login),
+                                    agent_icon: "\u{1F50D}".to_string(),
+                                },
+                                review.body.clone(),
+                                severity,
+                                None,
+                                None,
+                            );
+                            comment.status = CommentStatus::Approved;
+                            let already = draft.comments.iter().any(|c| {
+                                if let CommentSource::Agent { agent_id, .. } = &c.source {
+                                    agent_id == &format!("gh_review_{}", review.id)
+                                } else { false }
+                            });
+                            if !already { draft.comments.push(comment); }
+                        }
+
+                        // Add existing inline comments
+                        for ic in &comments {
+                            let mut comment = GeneratedComment::new(
+                                CommentSource::Agent {
+                                    agent_id: format!("gh_comment_{}", ic.id),
+                                    agent_name: format!("@{}", ic.user.login),
+                                    agent_icon: "\u{1F4AC}".to_string(),
+                                },
+                                ic.body.clone(),
+                                Severity::Suggestion,
+                                Some(ic.path.clone()),
+                                ic.line,
+                            );
+                            comment.status = CommentStatus::Approved;
+                            let already = draft.comments.iter().any(|c| {
+                                if let CommentSource::Agent { agent_id, .. } = &c.source {
+                                    agent_id == &format!("gh_comment_{}", ic.id)
+                                } else { false }
+                            });
+                            if !already { draft.comments.push(comment); }
+                        }
+
+                        let total = reviews.iter().filter(|r| !r.body.trim().is_empty()).count() + comments.len();
+                        if total > 0 {
+                            app.set_status(format!("{} existing review(s) loaded from GitHub — press [v] to view", total));
+                        }
                     }
 
                     AppEvent::SetupSaved(token, owner, repo) => {
@@ -207,6 +292,18 @@ async fn main() -> Result<()> {
                         app.setup_saving = false;
                         app.show_error(format!("Could not save config: {}", msg));
                     }
+
+                    AppEvent::QuickCommentDone => {
+                        app.show_info("Published", "Comment posted to GitHub successfully.");
+                        app.compose_text.clear();
+                        app.compose_cursor = 0;
+                        app.compose_quick_mode = false;
+                        app.navigate_back();
+                    }
+
+                    AppEvent::QuickCommentFailed(msg) => {
+                        app.show_error(format!("Failed to post comment: {}", msg));
+                    }
                 }
             }
 
@@ -224,6 +321,11 @@ async fn main() -> Result<()> {
                 };
                 for update in agent_updates {
                     handle_agent_update(&mut app, update);
+                }
+
+                if let Ok(size) = terminal.size() {
+                    // Approximate diff viewport: full height minus header(3) + keybind(3) + borders(2)
+                    app.diff_viewport_height = size.height.saturating_sub(8) as usize;
                 }
 
                 terminal.draw(|frame| ui::render(frame, &app))?;
@@ -278,13 +380,29 @@ async fn handle_action(
     if app.popup.is_some() {
         match action {
             Action::Confirm => {
-                let is_quit = app.popup.as_ref().map(|p| p.kind == PopupKind::ConfirmQuit).unwrap_or(false);
+                let kind = app.popup.as_ref().map(|p| p.kind.clone());
+                let pending = app.pending_publish.take();
                 app.dismiss_popup();
-                if is_quit {
-                    app.should_quit = true;
+                match kind {
+                    Some(PopupKind::ConfirmQuit) => {
+                        app.should_quit = true;
+                    }
+                    Some(PopupKind::ConfirmPublish) => {
+                        match pending {
+                            Some(PendingPublish::QuickComment { text }) => {
+                                publish_quick_comment(app, event_tx, config, text).await;
+                            }
+                            Some(PendingPublish::FullReview) => {
+                                publish_review(app, event_tx, config).await;
+                            }
+                            None => {}
+                        }
+                    }
+                    _ => {}
                 }
             }
             Action::Quit | Action::Back | Action::ExitInsert => {
+                app.pending_publish = None;
                 app.dismiss_popup();
             }
             _ => {}
@@ -308,6 +426,15 @@ async fn handle_action(
         }
 
         Action::Back => {
+            // Dismiss overlays first
+            if app.show_help {
+                app.show_help = false;
+                return;
+            }
+            if app.show_stats {
+                app.show_stats = false;
+                return;
+            }
             if app.input_mode == InputMode::Insert {
                 app.input_mode = InputMode::Normal;
                 return;
@@ -363,8 +490,16 @@ async fn handle_action(
                         0 => app.description_scroll = app.description_scroll.saturating_add(3),
                         _ => {
                             let max_lines = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
-                            app.diff_scroll = (app.diff_scroll + 3).min(max_lines);
+                            let max_scroll = max_lines.saturating_sub(app.diff_viewport_height);
+                            app.diff_scroll = (app.diff_scroll + 3).min(max_scroll);
                         }
+                    }
+                }
+                Screen::SummaryPreview => {
+                    if app.summary_pane == 0 {
+                        app.summary_body_scroll = app.summary_body_scroll.saturating_add(3);
+                    } else {
+                        app.summary_comments_scroll = app.summary_comments_scroll.saturating_add(1);
                     }
                 }
                 _ => {}
@@ -403,6 +538,13 @@ async fn handle_action(
                         _ => app.diff_scroll = app.diff_scroll.saturating_sub(3),
                     }
                 }
+                Screen::SummaryPreview => {
+                    if app.summary_pane == 0 {
+                        app.summary_body_scroll = app.summary_body_scroll.saturating_sub(3);
+                    } else {
+                        app.summary_comments_scroll = app.summary_comments_scroll.saturating_sub(1);
+                    }
+                }
                 _ => {}
             }
         }
@@ -421,7 +563,8 @@ async fn handle_action(
                 app.file_tree_scroll = app.file_tree_scroll.saturating_add(5);
             } else {
                 let max_lines = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
-                app.diff_scroll = (app.diff_scroll + 10).min(max_lines);
+                let max_scroll = max_lines.saturating_sub(app.diff_viewport_height);
+                app.diff_scroll = (app.diff_scroll + 10).min(max_scroll);
             }
         }
 
@@ -435,7 +578,8 @@ async fn handle_action(
 
         Action::PageDown => {
             let max_lines = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
-            app.diff_scroll = (app.diff_scroll + 25).min(max_lines);
+            let max_scroll = max_lines.saturating_sub(app.diff_viewport_height);
+            app.diff_scroll = (app.diff_scroll + 25).min(max_scroll);
         }
 
         Action::PageUp => {
@@ -449,11 +593,19 @@ async fn handle_action(
         }
 
         Action::NextPane => {
-            app.selected_pane = (app.selected_pane + 1) % 3;
+            if app.screen == Screen::SummaryPreview {
+                app.summary_pane = (app.summary_pane + 1) % 2;
+            } else {
+                app.selected_pane = (app.selected_pane + 1) % 3;
+            }
         }
 
         Action::PrevPane => {
-            app.selected_pane = if app.selected_pane == 0 { 2 } else { app.selected_pane - 1 };
+            if app.screen == Screen::SummaryPreview {
+                app.summary_pane = if app.summary_pane == 0 { 1 } else { 0 };
+            } else {
+                app.selected_pane = if app.selected_pane == 0 { 2 } else { app.selected_pane - 1 };
+            }
         }
 
         Action::Confirm => match app.screen {
@@ -477,14 +629,27 @@ async fn handle_action(
             }
             Screen::ReviewCompose => {
                 if app.input_mode == InputMode::Insert {
-                    // Insert a newline
+                    // newline
                     let pos = app.compose_cursor.min(app.compose_text.len());
                     app.compose_text.insert(pos, '\n');
                     app.compose_cursor += 1;
                 } else {
-                    // Save comment and navigate to DoubleCheck
-                    save_compose_comment(app);
-                    app.navigate_to(Screen::DoubleCheck);
+                    let text = app.compose_text.trim().to_string();
+                    if text.is_empty() {
+                        app.show_error("Comment cannot be empty.");
+                    } else if app.compose_quick_mode {
+                        // Quick comment: show confirmation popup, store pending action
+                        app.pending_publish = Some(crate::app::PendingPublish::QuickComment { text });
+                        app.popup = Some(crate::app::PopupState {
+                            title: "Publish Comment".to_string(),
+                            message: format!("Post comment to PR #{}?\n\nThis will be published immediately as a PR conversation comment.", app.current_pr.as_ref().map(|p| p.number).unwrap_or(0)),
+                            kind: crate::app::PopupKind::ConfirmPublish,
+                        });
+                    } else {
+                        // Inline review comment: save to draft and go to DoubleCheck
+                        save_compose_comment(app);
+                        app.navigate_to(Screen::DoubleCheck);
+                    }
                 }
             }
             Screen::SummaryPreview => {
@@ -530,6 +695,7 @@ async fn handle_action(
                 app.compose_file_path = None;
                 app.compose_line = None;
                 app.compose_context.clear();
+                app.compose_quick_mode = true;
                 app.navigate_to(Screen::ReviewCompose);
             } else if app.screen == Screen::FileTree && app.file_tree_pane == 1 {
                 // Get selected file and line for inline comment
@@ -550,6 +716,7 @@ async fn handle_action(
                     app.compose_context = context;
                     app.compose_text.clear();
                     app.compose_cursor = 0;
+                    app.compose_quick_mode = false;
                     app.navigate_to(Screen::ReviewCompose);
                 }
             }
@@ -576,6 +743,17 @@ async fn handle_action(
                     }
                 }
                 app.navigate_to(Screen::FileTree);
+            }
+        }
+
+        Action::OpenDoubleCheck => {
+            if matches!(app.screen, Screen::PrDetail | Screen::FileTree | Screen::ReviewCompose) {
+                // Ensure draft exists so DoubleCheck has somewhere to land
+                let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
+                app.draft.get_or_insert_with(|| {
+                    review::models::ReviewDraft::new(pr_num, review::models::ReviewMode::ManualOnly)
+                });
+                app.navigate_to(Screen::DoubleCheck);
             }
         }
 
@@ -662,12 +840,37 @@ async fn handle_action(
 
         Action::PreviewSummary => {
             if app.screen == Screen::DoubleCheck {
-                // Auto-generate review body from approved comments
-                if let Some(draft) = &mut app.draft {
-                    let body = draft.generate_body();
-                    draft.review_body = Some(body);
-                }
+                // Navigate to preview — body stays as-is (empty or previously generated)
+                app.summary_body_scroll = 0;
+                app.summary_comments_scroll = 0;
+                app.summary_pane = 0;
                 app.navigate_to(Screen::SummaryPreview);
+            }
+        }
+
+        Action::GenerateBody => {
+            if app.screen == Screen::SummaryPreview {
+                if let Some(draft) = &mut app.draft {
+                    let body = draft.generate_body_with_format(&app.config.publishing.format);
+                    draft.review_body = Some(body);
+                    app.summary_body_scroll = 0;
+                }
+                app.set_status("Review body generated.");
+            }
+        }
+
+        Action::InsertSuggestion => {
+            if app.screen == Screen::ReviewCompose && app.input_mode != InputMode::Insert {
+                // Build a suggestion block pre-filled with the current line's code
+                let current_code = app.compose_context
+                    .get(app.compose_context.len() / 2)
+                    .map(|l| if l.len() > 1 { l[1..].to_string() } else { String::new() })
+                    .unwrap_or_default();
+                let suggestion = format!("```suggestion\n{}\n```", current_code);
+                app.compose_text = suggestion;
+                app.compose_cursor = app.compose_text.len();
+                app.input_mode = InputMode::Normal;
+                app.set_status("Suggestion template inserted — edit the code block, then [Enter] to add.");
             }
         }
 
@@ -738,8 +941,31 @@ async fn handle_action(
 
         Action::Publish => {
             if app.screen == Screen::SummaryPreview {
-                publish_review(app, event_tx, config).await;
+                let event_name = match app.summary_event_idx {
+                    0 => "COMMENT",
+                    1 => "REQUEST_CHANGES",
+                    _ => "APPROVE",
+                };
+                let n = app.draft.as_ref().map(|d| d.approved_count()).unwrap_or(0);
+                app.pending_publish = Some(crate::app::PendingPublish::FullReview);
+                app.popup = Some(crate::app::PopupState {
+                    title: "Submit Review".to_string(),
+                    message: format!("Submit review to PR #{}?\n\nType: {}\nInline comments: {}",
+                        app.current_pr.as_ref().map(|p| p.number).unwrap_or(0),
+                        event_name, n),
+                    kind: crate::app::PopupKind::ConfirmPublish,
+                });
             }
+        }
+
+        Action::Help => {
+            app.show_help = !app.show_help;
+            app.show_stats = false; // close stats if open
+        }
+
+        Action::ShowStats => {
+            app.show_stats = !app.show_stats;
+            app.show_help = false; // close help if open
         }
 
         Action::NavLeft => {
@@ -828,6 +1054,13 @@ async fn handle_setup_action(
 
 fn handle_agent_update(app: &mut App, update: agents::orchestrator::AgentUpdate) {
     use agents::models::AgentStatus;
+
+    // Accumulate token stats when an agent completes
+    if let agents::models::AgentStatus::Done { input_tokens, output_tokens, .. } = &update.status {
+        app.token_input_total += input_tokens;
+        app.token_output_total += output_tokens;
+        app.token_calls_total += 1;
+    }
 
     // If all agents are done/failed/skipped and we're on AgentRunner, move to DoubleCheck
     app.agent_statuses.insert(update.agent_id, update.status);
@@ -932,6 +1165,21 @@ async fn open_pr(
             let _ = tx.send(AppEvent::TicketLoaded(ticket));
         });
     }
+
+    // Load existing reviews and inline comments from GitHub
+    {
+        let tx = event_tx.clone();
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            let api = match make_github_api(&cfg) {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let reviews = api.list_reviews(pr_num).await.unwrap_or_default();
+            let comments = api.list_inline_comments(pr_num).await.unwrap_or_default();
+            let _ = tx.send(AppEvent::ReviewsLoaded(reviews, comments));
+        });
+    }
 }
 
 fn start_agent_runner(app: &mut App, config: &config::AppConfig) {
@@ -993,8 +1241,8 @@ fn count_file_diff_lines(app: &App, path: &str) -> usize {
         let mut count = 0;
         let mut found = false;
         for line in diff.lines() {
-            if line == target { found = true; continue; }
-            if found && line.starts_with("diff --git ") { break; }
+            if line == target { found = true; }          // include the header line in count
+            else if found && line.starts_with("diff --git ") { break; }
             if found { count += 1; }
         }
         count
@@ -1181,6 +1429,105 @@ async fn load_ticket_for_pr(
     }
 
     tickets::extractor::resolve_ticket(&keys, &providers).await
+}
+
+// ── Quick comment publish ──────────────────────────────────────────────────
+
+async fn publish_quick_comment(
+    app: &mut App,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+    config: &config::AppConfig,
+    text: String,
+) {
+    let pr_num = match app.current_pr.as_ref().map(|p| p.number) {
+        Some(n) => n,
+        None => {
+            app.show_error("No PR loaded.");
+            return;
+        }
+    };
+
+    // If auto-translate is enabled and LLM available, translate first
+    let final_text = if config.publishing.auto_translate_to_english && config.is_llm_configured() {
+        app.set_status("Translating to English…");
+        match translate_to_english(&text, config).await {
+            Ok(translated) => translated,
+            Err(_) => text, // fall back to original on error
+        }
+    } else if config.publishing.auto_correct_grammar && config.is_llm_configured() {
+        app.set_status("Correcting grammar…");
+        match correct_grammar(&text, config).await {
+            Ok(corrected) => corrected,
+            Err(_) => text,
+        }
+    } else {
+        text
+    };
+
+    let tx = event_tx.clone();
+    let cfg = config.clone();
+    app.set_status("Publishing comment…");
+    tokio::spawn(async move {
+        let result = async {
+            let api = make_github_api(&cfg)?;
+            api.post_pr_comment(pr_num, &final_text).await
+        }.await;
+        match result {
+            Ok(()) => { let _ = tx.send(AppEvent::QuickCommentDone); }
+            Err(e) => { let _ = tx.send(AppEvent::QuickCommentFailed(format!("{:#}", e))); }
+        }
+    });
+}
+
+async fn translate_to_english(text: &str, config: &config::AppConfig) -> anyhow::Result<String> {
+    call_llm_for_text(
+        "You are a technical writing assistant. Translate the following text to English. Return ONLY the translated text, nothing else.",
+        text,
+        config,
+    ).await
+}
+
+async fn correct_grammar(text: &str, config: &config::AppConfig) -> anyhow::Result<String> {
+    call_llm_for_text(
+        "You are a technical writing assistant. Correct the grammar and spelling of the following text while preserving its meaning and technical terminology. Keep code blocks unchanged. Return ONLY the corrected text, nothing else.",
+        text,
+        config,
+    ).await
+}
+
+async fn call_llm_for_text(system: &str, text: &str, config: &config::AppConfig) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+    use std::process::Stdio;
+
+    let timeout_secs = config.agents.timeout_secs;
+    let mut child = Command::new("claude")
+        .arg("--print")
+        .arg("--system-prompt")
+        .arg(system)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn claude")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes()).await?;
+    }
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("LLM translation timed out"))??;
+
+    if !output.status.success() {
+        anyhow::bail!("claude exited with error");
+    }
+
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 // ── Tracing init ───────────────────────────────────────────────────────────

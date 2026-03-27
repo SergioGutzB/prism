@@ -96,12 +96,33 @@ pub(crate) struct GhPr {
     pub requested_reviewers: Option<Vec<GhUser>>,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct GhUser {
+#[derive(Debug, Clone, Deserialize)]
+pub struct GhUser {
     pub login: String,
 }
 
-#[derive(Debug, Deserialize)]
+/// A review fetched from GitHub (existing review on PR).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GhReview {
+    pub id: u64,
+    pub user: GhUser,
+    pub body: String,
+    pub state: String,  // "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"
+    pub submitted_at: Option<DateTime<Utc>>,
+}
+
+/// An existing inline PR review comment from GitHub.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GhPrComment {
+    pub id: u64,
+    pub user: GhUser,
+    pub body: String,
+    pub path: String,
+    pub line: Option<u32>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct GhRef {
     #[serde(rename = "ref")]
     pub ref_name: String,

@@ -49,9 +49,9 @@ impl AgentRunner {
         let start = Instant::now();
 
         match self.run_inner(agent, ctx).await {
-            Ok(comments) => {
+            Ok((comments, input_tokens, output_tokens)) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
-                AgentStatus::Done { comments, elapsed_ms }
+                AgentStatus::Done { comments, elapsed_ms, input_tokens, output_tokens }
             }
             Err(e) => AgentStatus::Failed {
                 error: format!("{:#}", e),
@@ -59,20 +59,25 @@ impl AgentRunner {
         }
     }
 
+    /// Returns (comments, input_token_estimate, output_token_estimate)
     async fn run_inner(
         &self,
         agent: &AgentDefinition,
         ctx: &ReviewContext,
-    ) -> Result<Vec<GeneratedComment>> {
+    ) -> Result<(Vec<GeneratedComment>, u64, u64)> {
         // Build the prompt
         let prompt = self.build_prompt(agent, ctx);
+        let system_len = agent.agent.prompt.system.len();
         debug!(agent_id = %agent.agent.id, prompt_len = prompt.len(), "Running agent");
 
         // Attempt LLM call with 1 retry on JSON parse failure
         let raw_response = self.call_llm(agent, &prompt).await?;
 
+        let input_tokens = ((system_len + prompt.len()) / 4) as u64;
+        let output_tokens = (raw_response.len() / 4) as u64;
+
         match self.parse_response(agent, &raw_response) {
-            Ok(comments) => Ok(comments),
+            Ok(comments) => Ok((comments, input_tokens, output_tokens)),
             Err(parse_err) => {
                 warn!(
                     agent_id = %agent.agent.id,
@@ -85,8 +90,12 @@ impl AgentRunner {
                     prompt
                 );
                 let retry_response = self.call_llm(agent, &retry_prompt).await?;
-                self.parse_response(agent, &retry_response)
-                    .context("JSON parse failed after retry")
+                // Add retry token costs too
+                let retry_in = (retry_prompt.len() / 4) as u64;
+                let retry_out = (retry_response.len() / 4) as u64;
+                let comments = self.parse_response(agent, &retry_response)
+                    .context("JSON parse failed after retry")?;
+                Ok((comments, input_tokens + retry_in, output_tokens + retry_out))
             }
         }
     }

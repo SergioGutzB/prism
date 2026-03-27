@@ -98,7 +98,7 @@ impl Orchestrator {
                     let status = runner.run(&agent, &ctx).await;
 
                     match &status {
-                        AgentStatus::Done { comments, elapsed_ms } => {
+                        AgentStatus::Done { comments, elapsed_ms, .. } => {
                             info!(
                                 agent_id = %agent_id,
                                 comment_count = comments.len(),

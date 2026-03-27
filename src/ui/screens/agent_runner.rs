@@ -24,7 +24,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_header(frame, app, chunks[0], &t);
     render_agent_list(frame, app, chunks[1], &t);
-    keybind_bar::render(frame, chunks[2], &[("[Esc]", "Cancel"), ("[q]", "Quit")], &t);
+    keybind_bar::render(frame, chunks[2], &[("[Esc]", "Cancel"), ("[q]", "Quit"), ("[T]", "Stats")], &t);
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
@@ -97,7 +97,7 @@ fn render_agent_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
             };
 
             let comment_info = match status {
-                Some(AgentStatus::Done { comments, elapsed_ms }) => {
+                Some(AgentStatus::Done { comments, elapsed_ms, .. }) => {
                     format!(" — {} comment(s) in {}ms", comments.len(), elapsed_ms)
                 }
                 Some(AgentStatus::Failed { error }) => {

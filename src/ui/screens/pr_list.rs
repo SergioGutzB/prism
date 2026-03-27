@@ -1,5 +1,5 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState};
 
 use crate::app::App;
 use crate::ui::components::keybind_bar;
@@ -37,6 +37,8 @@ pub fn render(frame: &mut Frame, app: &App) {
             ("[a]", "Agents"),
             ("[S]", "Settings"),
             ("[q]", "Quit"),
+            ("[?]", "Help"),
+            ("[T]", "Stats"),
         ],
         &t,
     );
@@ -208,6 +210,24 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let mut state = TableState::default();
     state.select(Some(app.pr_list_selected));
     frame.render_stateful_widget(table, area, &mut state);
+
+    // Vertical scrollbar
+    let total = prs.len();
+    let visible_height = area.height.saturating_sub(3) as usize; // header row + borders
+    if total > visible_height {
+        let max_s = total.saturating_sub(visible_height);
+        let pos = app.pr_list_selected.min(max_s);
+        let mut sb_state = ScrollbarState::new(max_s).position(pos);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .thumb_symbol("█")
+                .track_symbol(Some("│")),
+            area,
+            &mut sb_state,
+        );
+    }
 }
 
 fn format_age(dt: chrono::DateTime<chrono::Utc>) -> String {

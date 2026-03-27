@@ -56,3 +56,12 @@ agent_config = "a"
 settings = "S"
 preview_summary = "P"
 check_file = "x"
+
+[publishing]
+confirm_before_publish = true
+auto_translate_to_english = false
+auto_correct_grammar = false
+
+[publishing.format]
+body_template = "## Code Review\n\n{comment_count} comment(s) for PR #{pr_number}.\n\n{comments_list}"
+comment_template = "- **`{file}:{line}`** [{severity}] {body}"

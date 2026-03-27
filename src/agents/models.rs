@@ -55,6 +55,8 @@ pub enum AgentStatus {
     Done {
         comments: Vec<GeneratedComment>,
         elapsed_ms: u64,
+        input_tokens: u64,
+        output_tokens: u64,
     },
     Failed {
         error: String,

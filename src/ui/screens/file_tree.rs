@@ -1,5 +1,5 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap};
 
 use crate::app::App;
 use crate::review::models::{CommentSource, CommentStatus, Severity};
@@ -260,14 +260,26 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
             inner,
         );
 
-        // Scroll indicator
+        // Vertical scrollbar
         if total > inner.height as usize {
+            let max_s = total.saturating_sub(inner.height as usize);
+            let mut sb_state = ScrollbarState::new(max_s).position(effective_scroll.min(max_s));
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(Some("▲"))
+                    .end_symbol(Some("▼"))
+                    .thumb_symbol("█")
+                    .track_symbol(Some("│")),
+                detail_chunks[0],
+                &mut sb_state,
+            );
+            // Line counter
             let indicator = format!(" {}/{} ", effective_scroll + 1, total);
-            let ind_w = indicator.len() as u16;
+            let iw = indicator.len() as u16;
             let ind_area = Rect {
-                x: detail_chunks[0].right().saturating_sub(ind_w + 1),
+                x: detail_chunks[0].right().saturating_sub(iw + 2),
                 y: detail_chunks[0].bottom().saturating_sub(1),
-                width: ind_w,
+                width: iw,
                 height: 1,
             };
             frame.render_widget(

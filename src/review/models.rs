@@ -206,6 +206,45 @@ impl ReviewDraft {
         body
     }
 
+    pub fn generate_body_with_format(&self, fmt: &crate::config::ReviewFormatConfig) -> String {
+        let approved = self.approved_comments();
+        if approved.is_empty() {
+            return String::new();
+        }
+
+        let critical_count = approved.iter().filter(|c| c.severity == Severity::Critical).count();
+        let warning_count = approved.iter().filter(|c| c.severity == Severity::Warning).count();
+        let suggestion_count = approved.iter().filter(|c| c.severity == Severity::Suggestion).count();
+        let praise_count = approved.iter().filter(|c| c.severity == Severity::Praise).count();
+
+        let comments_list: String = approved.iter().map(|c| {
+            let file = c.file_path.as_deref().unwrap_or("general");
+            let line = c.line.map(|l| l.to_string()).unwrap_or_else(|| "-".to_string());
+            let severity = c.severity.to_string();
+            let body = c.effective_body();
+            let source = match &c.source {
+                CommentSource::Agent { agent_name, .. } => agent_name.as_str(),
+                CommentSource::Manual => "manual",
+            };
+            fmt.comment_template
+                .replace("{file}", file)
+                .replace("{line}", &line)
+                .replace("{severity}", &severity)
+                .replace("{body}", body)
+                .replace("{source}", source)
+        }).collect::<Vec<_>>().join("\n");
+
+        fmt.body_template
+            .replace("{pr_number}", &self.pr_number.to_string())
+            .replace("{pr_title}", "") // not available in draft
+            .replace("{comment_count}", &approved.len().to_string())
+            .replace("{critical_count}", &critical_count.to_string())
+            .replace("{warning_count}", &warning_count.to_string())
+            .replace("{suggestion_count}", &suggestion_count.to_string())
+            .replace("{praise_count}", &praise_count.to_string())
+            .replace("{comments_list}", &comments_list)
+    }
+
     pub fn pending_count(&self) -> usize {
         self.comments
             .iter()

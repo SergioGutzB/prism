@@ -135,9 +135,14 @@ pub enum Action {
     CheckFile,
     FileTree,
     ToggleFullscreen,
+    OpenDoubleCheck,
     Delete,
     EnterInsert,
     ExitInsert,
+    InsertSuggestion,
+    GenerateBody,
+    Help,
+    ShowStats,
     Char(char),
     FilterAgent(u8),
 }
@@ -209,6 +214,11 @@ pub fn map_key(key: &KeyEvent, mode: &InputMode) -> Option<Action> {
                 KeyCode::Char('f') => Some(Action::FileTree),
                 KeyCode::Char('i') => Some(Action::EnterInsert),
                 KeyCode::Char('z') => Some(Action::ToggleFullscreen),
+                KeyCode::Char('v') => Some(Action::OpenDoubleCheck),
+                KeyCode::Char('s') => Some(Action::InsertSuggestion),
+                KeyCode::Char('g') => Some(Action::GenerateBody),
+                KeyCode::Char('?') => Some(Action::Help),
+                KeyCode::Char('T') => Some(Action::ShowStats),
                 // Filter by agent number (1-7)
                 KeyCode::Char(c @ '1'..='7') => {
                     Some(Action::FilterAgent(c as u8 - b'0'))

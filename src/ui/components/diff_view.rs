@@ -1,5 +1,5 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use crate::app::App;
 use crate::ui::components::syntax;
@@ -117,15 +117,26 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, t: &Theme, focused: bool
         inner,
     );
 
-    // Scroll indicator: line position, not a loading percentage
+    // Vertical scrollbar (renders over the right border)
     if total > inner.height as usize {
-        let current_line = scroll + 1;
-        let indicator = format!(" {}/{} ", current_line, total);
-        let ind_width = indicator.len() as u16;
+        let mut sb_state = ScrollbarState::new(max_scroll).position(scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .thumb_symbol("█")
+                .track_symbol(Some("│")),
+            area,
+            &mut sb_state,
+        );
+
+        // Line counter in the bottom-right corner (inside the border)
+        let indicator = format!(" {}/{} ", scroll + 1, total);
+        let iw = indicator.len() as u16;
         let ind_area = Rect {
-            x: area.right().saturating_sub(ind_width + 1),
+            x: area.right().saturating_sub(iw + 2),
             y: area.bottom().saturating_sub(1),
-            width: ind_width,
+            width: iw,
             height: 1,
         };
         frame.render_widget(

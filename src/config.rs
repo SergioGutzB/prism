@@ -11,6 +11,47 @@ pub struct AppConfig {
     pub llm: LlmConfig,
     pub agents: AgentsConfig,
     pub ui: UiConfig,
+    #[serde(default)]
+    pub publishing: PublishingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PublishingConfig {
+    pub confirm_before_publish: bool,
+    pub auto_translate_to_english: bool,
+    pub auto_correct_grammar: bool,
+    pub format: ReviewFormatConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReviewFormatConfig {
+    /// Template for the overall review body.
+    /// Variables: {pr_number}, {pr_title}, {comment_count},
+    /// {critical_count}, {warning_count}, {suggestion_count}, {praise_count}, {comments_list}
+    pub body_template: String,
+    /// Template for each comment entry in the list.
+    /// Variables: {file}, {line}, {severity}, {body}, {source}
+    pub comment_template: String,
+}
+
+impl Default for PublishingConfig {
+    fn default() -> Self {
+        Self {
+            confirm_before_publish: true,
+            auto_translate_to_english: false,
+            auto_correct_grammar: false,
+            format: ReviewFormatConfig::default(),
+        }
+    }
+}
+
+impl Default for ReviewFormatConfig {
+    fn default() -> Self {
+        Self {
+            body_template: "## Code Review\n\n{comment_count} comment(s) for PR #{pr_number}.\n\n{comments_list}".to_string(),
+            comment_template: "- **`{file}:{line}`** [{severity}] {body}".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

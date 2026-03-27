@@ -25,6 +25,10 @@ pub enum AppEvent {
     /// Carries (token, owner, repo) so main can reload and start.
     SetupSaved(String, String, String),
     SetupFailed(String),
+    UserLoaded(String),
+    ReviewsLoaded(Vec<crate::github::models::GhReview>, Vec<crate::github::models::GhPrComment>),
+    QuickCommentDone,
+    QuickCommentFailed(String),
 }
 
 /// Spawn a background thread that polls crossterm key events.

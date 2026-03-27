@@ -1,5 +1,6 @@
 pub mod agent_status;
 pub mod comment_card;
+pub mod help;
 pub mod markdown;
 pub mod syntax;
 pub mod diff_view;
@@ -9,3 +10,4 @@ pub mod keybind_bar;
 pub mod popup;
 pub mod progress;
 pub mod ticket_panel;
+pub mod token_stats;

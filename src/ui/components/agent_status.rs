@@ -23,8 +23,9 @@ pub fn status_line<'a>(
     };
 
     let detail = match status {
-        Some(AgentStatus::Done { comments, elapsed_ms }) => {
-            format!("{} comment(s) in {}ms", comments.len(), elapsed_ms)
+        Some(AgentStatus::Done { comments, elapsed_ms, input_tokens, output_tokens }) => {
+            format!("{} comment(s) in {}ms  ~{}in/{}out tok",
+                comments.len(), elapsed_ms, input_tokens, output_tokens)
         }
         Some(AgentStatus::Failed { error }) => error.clone(),
         Some(AgentStatus::Skipped { reason }) => reason.clone(),

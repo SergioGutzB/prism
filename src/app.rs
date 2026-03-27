@@ -53,6 +53,13 @@ pub enum PopupKind {
     Confirm,
     /// Requires Enter to confirm quit, Esc to cancel.
     ConfirmQuit,
+    ConfirmPublish,
+}
+
+#[derive(Debug, Clone)]
+pub enum PendingPublish {
+    QuickComment { text: String },
+    FullReview,
 }
 
 /// Global application state — all mutable state lives here.
@@ -93,6 +100,8 @@ pub struct App {
     pub key_detector: KeySequenceDetector,
     pub selected_pane: usize,
     pub diff_scroll: usize,
+    pub diff_viewport_height: usize,
+    pub github_user: Option<String>,
     pub should_quit: bool,
     pub status_message: Option<String>,
     pub popup: Option<PopupState>,
@@ -104,8 +113,11 @@ pub struct App {
     // DoubleCheck selection
     pub double_check_selected: usize,
 
-    // SummaryPreview — which review event radio is selected
+    // SummaryPreview state
     pub summary_event_idx: usize,
+    pub summary_pane: usize,           // 0 = body, 1 = comments
+    pub summary_body_scroll: usize,
+    pub summary_comments_scroll: usize,
 
     // AgentConfig selection
     pub agent_config_selected: usize,
@@ -127,6 +139,9 @@ pub struct App {
     pub file_tree_pane: u8,            // 0 = file list, 1 = detail panel
     pub file_tree_line: usize,         // selected line in detail panel
 
+    pub compose_quick_mode: bool,
+    pub pending_publish: Option<PendingPublish>,
+
     // Inline comment state
     pub compose_file_path: Option<String>,  // file for inline comment
     pub compose_line: Option<u32>,          // line for inline comment
@@ -134,6 +149,15 @@ pub struct App {
 
     // Per-diff-line precomputed file extension for syntax highlighting
     pub diff_line_ext: Vec<Option<String>>,
+
+    // Overlay visibility
+    pub show_help: bool,
+    pub show_stats: bool,
+
+    // Token consumption statistics
+    pub token_input_total: u64,
+    pub token_output_total: u64,
+    pub token_calls_total: u64,
 
     // Setup wizard state
     pub setup_gh_token: String,       // token detected from gh CLI
@@ -168,13 +192,20 @@ impl App {
             key_detector: KeySequenceDetector::new(),
             selected_pane: 0,
             diff_scroll: 0,
+            diff_viewport_height: 20,
+            github_user: None,
             should_quit: false,
             status_message: None,
             popup: None,
             compose_text: String::new(),
             compose_cursor: 0,
+            compose_quick_mode: false,
+            pending_publish: None,
             double_check_selected: 0,
-            summary_event_idx: 1, // default: COMMENT
+            summary_event_idx: 0, // default: COMMENT
+            summary_pane: 0,
+            summary_body_scroll: 0,
+            summary_comments_scroll: 0,
             agent_config_selected: 0,
             screen_stack: Vec::new(),
             diff_fullscreen: false,
@@ -186,6 +217,11 @@ impl App {
             compose_line: None,
             compose_context: Vec::new(),
             diff_line_ext: Vec::new(),
+            show_help: false,
+            show_stats: false,
+            token_input_total: 0,
+            token_output_total: 0,
+            token_calls_total: 0,
             setup_gh_token: String::new(),
             setup_owner: String::new(),
             setup_repo: String::new(),

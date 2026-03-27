@@ -16,16 +16,29 @@ pub fn render(frame: &mut Frame, app: &App) {
     );
 
     let has_context = app.compose_file_path.is_some() && !app.compose_context.is_empty();
-
-    let hint = if app.input_mode == InputMode::Insert {
-        &[("[Esc]", "Normal mode"), ("[Enter]", "New line")][..]
+    let hint: &[(&str, &str)] = if app.input_mode == InputMode::Insert {
+        &[("[Esc]", "Normal mode"), ("[Enter]", "New line")]
+    } else if app.compose_quick_mode {
+        &[
+            ("[i]", "Insert"),
+            ("[Esc]", "Cancel"),
+            ("[Enter]", "Publish comment"),
+        ]
+    } else if has_context {
+        &[
+            ("[i]", "Insert"),
+            ("[s]", "Suggestion block"),
+            ("[Esc]", "Back"),
+            ("[Enter]", "Add to Review"),
+            ("[v]", "View Reviews"),
+        ]
     } else {
         &[
             ("[i]", "Insert"),
             ("[Esc]", "Back"),
-            ("[Enter]", "Save"),
-            ("[f]", "Files"),
-        ][..]
+            ("[Enter]", "Add to Review"),
+            ("[v]", "View Reviews"),
+        ]
     };
 
     if has_context {
@@ -110,10 +123,15 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         (Some(f), None) => format!(" — {}", f),
         _ => String::new(),
     };
-    let title = format!(" Compose Comment — PR #{pr_num}{location} ");
+    let mode_label = if app.compose_quick_mode {
+        " Quick Comment"
+    } else {
+        " Compose Comment"
+    };
+    let title = format!("{} — PR #{pr_num}{location} ", mode_label);
     let block = Block::default()
         .title(title.as_str())
-        .title_style(Style::default().fg(t.title).add_modifier(Modifier::BOLD))
+        .title_style(Style::default().fg(if app.compose_quick_mode { t.warning } else { t.title }).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.border_focused))
         .style(Style::default().bg(t.background));

@@ -3,7 +3,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::github::client::GitHubClient;
-use crate::github::models::{GhPr, PrDetails, PrState, PrSummary, ReviewRequest};
+use crate::github::models::{GhPr, GhPrComment, GhReview, PrDetails, PrState, PrSummary, ReviewRequest};
 
 pub struct GitHubApi {
     client: GitHubClient,
@@ -162,6 +162,71 @@ impl GitHubApi {
             anyhow::bail!("GitHub API error {}: {}", status, body);
         }
 
+        Ok(())
+    }
+
+    /// Get the authenticated user's login.
+    pub async fn get_current_user(&self) -> Result<String> {
+        let url = format!("{}/user", self.client.base_url);
+        let response = self.client.client.get(&url).send().await
+            .context("Failed to fetch current user")?;
+        if !response.status().is_success() {
+            anyhow::bail!("Could not fetch GitHub user");
+        }
+        let data: serde_json::Value = response.json().await?;
+        Ok(data["login"].as_str().unwrap_or("unknown").to_string())
+    }
+
+    /// List existing reviews for a PR.
+    pub async fn list_reviews(&self, pr_number: u64) -> Result<Vec<GhReview>> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/reviews?per_page=100",
+            self.client.base_url, self.client.owner, self.client.repo, pr_number
+        );
+        debug!("GET reviews for PR #{}", pr_number);
+        let response = self.client.client.get(&url).send().await
+            .context("Failed to fetch PR reviews")?;
+        if !response.status().is_success() {
+            return Ok(Vec::new()); // non-critical, return empty
+        }
+        response.json().await.context("Failed to parse reviews")
+    }
+
+    /// List existing inline review comments for a PR.
+    pub async fn list_inline_comments(&self, pr_number: u64) -> Result<Vec<GhPrComment>> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/comments?per_page=100",
+            self.client.base_url, self.client.owner, self.client.repo, pr_number
+        );
+        debug!("GET inline comments for PR #{}", pr_number);
+        let response = self.client.client.get(&url).send().await
+            .context("Failed to fetch PR comments")?;
+        if !response.status().is_success() {
+            return Ok(Vec::new());
+        }
+        response.json().await.context("Failed to parse PR comments")
+    }
+
+    /// Post a plain comment to the PR conversation (not a review).
+    pub async fn post_pr_comment(&self, pr_number: u64, body: &str) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}/comments",
+            self.client.base_url, self.client.owner, self.client.repo, pr_number
+        );
+        debug!("POST PR comment to #{}", pr_number);
+        let response = self
+            .client
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await
+            .context("Failed to post PR comment")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("GitHub API error {}: {}", status, body);
+        }
         Ok(())
     }
 

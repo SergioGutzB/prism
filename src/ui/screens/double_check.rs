@@ -1,5 +1,5 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use crate::app::App;
 use crate::review::models::{CommentSource, CommentStatus, Severity};
@@ -31,10 +31,12 @@ pub fn render(frame: &mut Frame, app: &App) {
             ("[Esc]", "Back"),
             ("[jk]", "Nav"),
             ("[Space]", "Toggle"),
+            ("[c]", "New comment"),
             ("[A]", "Approve all"),
             ("[D]", "Reject all"),
             ("[P]", "Preview"),
             ("[1-7]", "Filter agent"),
+            ("[?]", "Help"),
         ],
         &t,
     );
@@ -225,4 +227,22 @@ fn render_comments(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .highlight_style(Style::default().bg(t.selected_bg).fg(t.selected_fg));
 
     frame.render_stateful_widget(list, area, &mut list_state);
+
+    // Vertical scrollbar
+    let total_items = comments.len();
+    let visible_height = area.height.saturating_sub(2) as usize; // subtract borders
+    if total_items > visible_height {
+        let max_s = total_items.saturating_sub(visible_height);
+        let pos = display_selected.min(max_s);
+        let mut sb_state = ScrollbarState::new(max_s).position(pos);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .thumb_symbol("█")
+                .track_symbol(Some("│")),
+            area,
+            &mut sb_state,
+        );
+    }
 }
