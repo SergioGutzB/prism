@@ -24,7 +24,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_header(frame, app, chunks[0], &t);
     render_agent_list(frame, app, chunks[1], &t);
-    keybind_bar::render(frame, chunks[2], &[("[Esc]", "Cancel"), ("[q]", "Quit"), ("[T]", "Stats")], &t);
+    keybind_bar::render(frame, chunks[2], &[("[Esc]", "Cancel"), ("[q]", "Quit"), ("[T]", "Stats"), ("[X]", "Clear cache")], &t);
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
@@ -42,8 +42,15 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let total = app.agents.len();
 
     let title = format!(" Agent Runner — PR #{pr_num} ");
+    let skipped = app
+        .agent_statuses
+        .values()
+        .filter(|s| matches!(s, AgentStatus::Skipped { .. }))
+        .count();
     let status = if running > 0 {
         format!(" {} Running agents… {done}/{total} done ", app.spinner_char())
+    } else if skipped > 0 {
+        format!(" {done}/{total} completed  ⚡ {skipped} from cache ")
     } else {
         format!(" {done}/{total} completed ")
     };

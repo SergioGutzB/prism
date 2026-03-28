@@ -136,6 +136,18 @@ async fn main() -> Result<()> {
 
                     AppEvent::PrListLoaded(prs) => {
                         info!("PR list loaded: {} PRs", prs.len());
+                        // Prune caches for closed/merged PRs and stale entries (background)
+                        {
+                            let open_numbers: Vec<u64> = prs.iter().map(|p| p.number).collect();
+                            let repo_slug = format!(
+                                "{}/{}",
+                                config.github.owner, config.github.repo
+                            );
+                            tokio::spawn(async move {
+                                crate::review::cache::prune_closed(&repo_slug, &open_numbers);
+                                crate::review::cache::prune_stale(&repo_slug, 30);
+                            });
+                        }
                         app.pr_list = prs;
                         app.pr_list_loading = false;
                         if app.pr_list.is_empty() {
@@ -305,22 +317,31 @@ async fn main() -> Result<()> {
                         app.show_error(format!("Failed to post comment: {}", msg));
                     }
 
-                    AppEvent::ClaudeOutputChunk(chunk) => {
-                        app.claude_output.push_str(&chunk);
-                        // Auto-scroll to bottom while loading
-                        if app.claude_output_loading {
-                            let line_count = app.claude_output.lines().count();
-                            app.claude_output_scroll = line_count.saturating_sub(1);
+                    AppEvent::FixTaskChunk(idx, chunk) => {
+                        if let Some(task) = app.fix_tasks.get_mut(idx) {
+                            task.output.push_str(&chunk);
                         }
+                        // Auto-follow the running task and scroll its output to bottom
+                        app.fix_task_selected = idx;
+                        let line_count = app.fix_tasks.get(idx)
+                            .map(|t| t.output.lines().count())
+                            .unwrap_or(0);
+                        app.claude_output_scroll = line_count.saturating_sub(1);
                     }
 
-                    AppEvent::ClaudeOutputDone => {
-                        app.claude_output_loading = false;
+                    AppEvent::FixTaskDone(idx) => {
+                        if let Some(task) = app.fix_tasks.get_mut(idx) {
+                            task.status = app::FixTaskStatus::Done;
+                        }
+                        advance_fix_tasks(&mut app, &event_tx, &config);
                     }
 
-                    AppEvent::ClaudeOutputFailed(msg) => {
-                        app.claude_output_loading = false;
-                        app.claude_output.push_str(&format!("\n\n❌ Failed: {}", msg));
+                    AppEvent::FixTaskFailed(idx, msg) => {
+                        if let Some(task) = app.fix_tasks.get_mut(idx) {
+                            task.status = app::FixTaskStatus::Failed(msg);
+                        }
+                        // Continue with the next pending task even if one fails
+                        advance_fix_tasks(&mut app, &event_tx, &config);
                     }
                 }
             }
@@ -544,8 +565,12 @@ async fn handle_action(
                     }
                 }
                 Screen::ClaudeCodeOutput => {
-                    let max = app.claude_output.lines().count();
-                    app.claude_output_scroll = (app.claude_output_scroll + 3).min(max);
+                    // j scrolls the output of the selected task OR navigates down the task list
+                    let task_count = app.fix_tasks.len();
+                    if task_count > 0 && app.fix_task_selected < task_count - 1 {
+                        app.fix_task_selected += 1;
+                        app.claude_output_scroll = 0;
+                    }
                 }
                 _ => {}
             }
@@ -596,7 +621,11 @@ async fn handle_action(
                     }
                 }
                 Screen::ClaudeCodeOutput => {
-                    app.claude_output_scroll = app.claude_output_scroll.saturating_sub(3);
+                    // k navigates up the task list
+                    if app.fix_task_selected > 0 {
+                        app.fix_task_selected -= 1;
+                        app.claude_output_scroll = 0;
+                    }
                 }
                 _ => {}
             }
@@ -649,8 +678,10 @@ async fn handle_action(
                     app.file_tree_scroll = usize::MAX / 2; // clamped by render
                 }
                 Screen::ClaudeCodeOutput => {
-                    let max = app.claude_output.lines().count();
-                    app.claude_output_scroll = max;
+                    let line_count = app.fix_tasks.get(app.fix_task_selected)
+                        .map(|t| t.output.lines().count())
+                        .unwrap_or(0);
+                    app.claude_output_scroll = line_count;
                 }
                 _ => { app.go_bottom(); }
             }
@@ -786,10 +817,10 @@ async fn handle_action(
 
         Action::ClaudeCodeFix => {
             if app.screen == Screen::DoubleCheck {
-                send_to_claude_code(app, event_tx, config);
+                start_fix_tasks(app, event_tx, config);
             } else if app.screen == Screen::ClaudeCodeOutput && !app.claude_output_loading {
-                // Retry the last job from the output screen
-                retry_claude_fix(app, event_tx, config);
+                // Retry the selected failed task
+                retry_selected_fix_task(app, event_tx, config);
             }
         }
 
@@ -805,6 +836,22 @@ async fn handle_action(
                     ),
                     kind: crate::app::PopupKind::ConfirmRestart,
                 });
+            }
+        }
+
+        Action::ClearCache => {
+            if app.screen == Screen::AgentRunner || app.screen == Screen::PrDetail
+                || app.screen == Screen::DoubleCheck
+            {
+                if let (Some(pr), Some(cfg_gh)) = (
+                    app.current_pr.as_ref(),
+                    Some(&config.github),
+                ) {
+                    let repo_slug = format!("{}/{}", cfg_gh.owner, cfg_gh.repo);
+                    let pr_number = pr.number;
+                    crate::review::cache::delete(pr_number, &repo_slug);
+                    app.set_status(format!("Cache cleared for PR #{pr_number}"));
+                }
             }
         }
 
@@ -1350,7 +1397,8 @@ fn start_agent_runner(app: &mut App, config: &config::AppConfig) {
 
     let diff = app.current_diff.clone().unwrap_or_default();
     let ticket = app.current_ticket.clone();
-    let ctx = ReviewContext::from_pr(&pr, &diff, ticket);
+    let repo_slug = format!("{}/{}", config.github.owner, config.github.repo);
+    let ctx = ReviewContext::from_pr(&pr, &diff, ticket, &repo_slug);
 
     let pr_num = pr.number;
     app.draft = Some(ReviewDraft::new(pr_num, ReviewMode::AiOnly));
@@ -1411,7 +1459,8 @@ fn run_missing_agents(app: &mut App, config: &config::AppConfig) {
 
     let diff = app.current_diff.clone().unwrap_or_default();
     let ticket = app.current_ticket.clone();
-    let ctx = ReviewContext::from_pr(&pr, &diff, ticket);
+    let repo_slug = format!("{}/{}", config.github.owner, config.github.repo);
+    let ctx = ReviewContext::from_pr(&pr, &diff, ticket, &repo_slug);
 
     // Keep existing draft or create one; keep existing comments
     let pr_num = pr.number;
@@ -1614,125 +1663,137 @@ async fn publish_review(
     });
 }
 
-// ── Claude Code integration ─────────────────────────────────────────────────
+// ── Claude Code AI-fix (per-comment task list) ──────────────────────────────
 
-/// Build the review task prompt from all non-rejected comments in the draft.
-fn build_claude_fix_prompt(app: &App) -> String {
-    use review::models::CommentStatus;
+/// Build fix tasks — one per non-rejected review comment — and start processing.
+fn start_fix_tasks(
+    app: &mut App,
+    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
+    config: &config::AppConfig,
+) {
+    use review::models::{CommentSource, CommentStatus};
+
     let pr = app.current_pr.as_ref();
     let pr_num = pr.map(|p| p.number).unwrap_or(0);
-    let pr_title = pr.map(|p| p.title.as_str()).unwrap_or("Unknown PR");
+    let pr_title = pr.map(|p| p.title.clone()).unwrap_or_else(|| "Unknown PR".to_string());
 
-    let mut prompt = format!(
-        "You are a code-review assistant. Below are review comments that need to be applied \
-         to the codebase. For each comment, implement the suggested change as a concrete code \
-         edit. Show the exact file path, line numbers, and the corrected code.\n\n\
-         ## PR #{pr_num}: {pr_title}\n\n"
-    );
+    let Some(draft) = &app.draft else { return };
 
-    let draft = match &app.draft {
-        Some(d) => d,
-        None => {
-            prompt.push_str("No review comments found.");
-            return prompt;
-        }
-    };
-
-    let submittable: Vec<_> = draft.comments.iter()
+    let tasks: Vec<app::FixTask> = draft.comments.iter()
         .filter(|c| c.status != CommentStatus::Rejected)
+        .enumerate()
+        .map(|(i, comment)| {
+            let source = match &comment.source {
+                CommentSource::Agent { agent_name, .. } => agent_name.clone(),
+                CommentSource::Manual => "Manual".to_string(),
+            };
+            let location = match (&comment.file_path, comment.line) {
+                (Some(f), Some(l)) => format!("{f}:{l}"),
+                (Some(f), None)    => f.clone(),
+                _                  => "(general)".to_string(),
+            };
+            let body = comment.effective_body();
+            let summary = body.lines().next().unwrap_or("").chars().take(60).collect();
+
+            let prompt = format!(
+                "You are a code-review assistant. Apply the following single review comment to \
+                 the codebase. Show the exact file path, line numbers, and the corrected code.\n\n\
+                 ## PR #{pr_num}: {pr_title}\n\n\
+                 ### [{:?}] @ {location}\nSource: {source}\n\n{body}\n\n\
+                 Provide:\n\
+                 1. The exact file and line(s) to change\n\
+                 2. The corrected code\n\
+                 3. A brief explanation of the fix",
+                comment.severity
+            );
+
+            app::FixTask {
+                index: i + 1,
+                location,
+                source,
+                summary,
+                status: app::FixTaskStatus::Pending,
+                output: String::new(),
+                prompt,
+            }
+        })
         .collect();
 
-    if submittable.is_empty() {
-        prompt.push_str("No comments to process (all were rejected).");
-        return prompt;
-    }
-
-    for (i, comment) in submittable.iter().enumerate() {
-        use review::models::CommentSource;
-        let source = match &comment.source {
-            CommentSource::Agent { agent_name, .. } => agent_name.clone(),
-            CommentSource::Manual => "Manual".to_string(),
-        };
-        let location = match (&comment.file_path, comment.line) {
-            (Some(f), Some(l)) => format!("{f}:{l}"),
-            (Some(f), None) => f.clone(),
-            _ => "(general)".to_string(),
-        };
-        prompt.push_str(&format!(
-            "### Comment {} — [{:?}] @ {}\nSource: {}\n\n{}\n\n---\n\n",
-            i + 1,
-            comment.severity,
-            location,
-            source,
-            comment.effective_body(),
-        ));
-    }
-
-    prompt.push_str(
-        "For each comment above, provide:\n\
-         1. The exact file and line(s) to change\n\
-         2. The corrected code\n\
-         3. A brief explanation of the fix\n"
-    );
-    prompt
-}
-
-/// Spawn a Claude Code subprocess with the review task and send results via event channel.
-/// Stores the prompt in `app.claude_fix_prompt` so the user can retry.
-fn send_to_claude_code(
-    app: &mut App,
-    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
-    config: &config::AppConfig,
-) {
-    let prompt = build_claude_fix_prompt(app);
-    spawn_claude_fix(app, tx, config, prompt);
-}
-
-/// Re-run the last AI-fix job using the previously built prompt.
-fn retry_claude_fix(
-    app: &mut App,
-    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
-    config: &config::AppConfig,
-) {
-    if app.claude_fix_prompt.is_empty() {
+    if tasks.is_empty() {
         return;
     }
-    let prompt = app.claude_fix_prompt.clone();
-    spawn_claude_fix(app, tx, config, prompt);
-}
 
-fn spawn_claude_fix(
-    app: &mut App,
-    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
-    config: &config::AppConfig,
-    prompt: String,
-) {
-    app.claude_fix_prompt = prompt.clone();
-    let tx = tx.clone();
-    let llm = config.llm.clone();
-    // At least 5 minutes — AI-fix tasks can be large
-    let timeout = config.agents.timeout_secs.max(300);
-
-    app.claude_output = String::new();
+    app.fix_tasks = tasks;
+    app.fix_task_selected = 0;
     app.claude_output_scroll = 0;
     app.claude_output_loading = true;
     app.navigate_to(Screen::ClaudeCodeOutput);
 
+    advance_fix_tasks(app, tx, config);
+}
+
+/// Start the next pending fix task, or mark loading done if all tasks are finished.
+fn advance_fix_tasks(
+    app: &mut App,
+    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
+    config: &config::AppConfig,
+) {
+    let idx = app.fix_tasks.iter().position(|t| t.status == app::FixTaskStatus::Pending);
+    if let Some(idx) = idx {
+        app.fix_tasks[idx].status = app::FixTaskStatus::Running;
+        app.fix_task_selected = idx;
+        app.claude_output_scroll = 0;
+        let prompt = app.fix_tasks[idx].prompt.clone();
+        spawn_single_fix_task(idx, prompt, tx, config);
+    } else {
+        app.claude_output_loading = false;
+    }
+}
+
+/// Mark the selected failed task as Pending and re-run it.
+fn retry_selected_fix_task(
+    app: &mut App,
+    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
+    config: &config::AppConfig,
+) {
+    let idx = app.fix_task_selected;
+    if let Some(task) = app.fix_tasks.get_mut(idx) {
+        if matches!(task.status, app::FixTaskStatus::Failed(_)) {
+            task.status = app::FixTaskStatus::Pending;
+            task.output.clear();
+        } else {
+            return; // nothing to retry
+        }
+    }
+    app.claude_output_loading = true;
+    advance_fix_tasks(app, tx, config);
+}
+
+/// Spawn Claude for a single fix task and stream its output back via events.
+fn spawn_single_fix_task(
+    task_idx: usize,
+    prompt: String,
+    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
+    config: &config::AppConfig,
+) {
+    let tx = tx.clone();
+    let llm = config.llm.clone();
+    let timeout = config.agents.timeout_secs;
+
     tokio::spawn(async move {
-        let system = "You are a senior software engineer performing code review corrections. \
-            Respond with concrete, actionable code changes. Be precise about file paths and line numbers.";
+        let system = "You are a senior software engineer applying a single code review comment. \
+            Be precise about file paths and line numbers. Show the corrected code.";
 
         let is_cli = matches!(llm.provider.as_str(), "claude-cli" | "claude");
 
         if is_cli {
-            // Stream stdout line-by-line so the user sees progress in real time
-            match stream_claude_cli(system, &prompt, timeout, &tx).await {
-                Ok(()) => { let _ = tx.send(tui::event::AppEvent::ClaudeOutputDone); }
-                Err(e) => { let _ = tx.send(tui::event::AppEvent::ClaudeOutputFailed(format!("{:#}", e))); }
+            match stream_claude_cli_task(task_idx, system, &prompt, timeout, &tx).await {
+                Ok(()) => { let _ = tx.send(tui::event::AppEvent::FixTaskDone(task_idx)); }
+                Err(e) => { let _ = tx.send(tui::event::AppEvent::FixTaskFailed(task_idx, format!("{:#}", e))); }
             }
         } else {
-            // API providers: collect full response then emit as one chunk
             let client = reqwest::Client::new();
+            let label = format!("fix-task-{}", task_idx + 1);
             let result = agents::runner::call_provider(
                 &client,
                 &llm,
@@ -1742,23 +1803,26 @@ fn spawn_claude_fix(
                 system,
                 &prompt,
                 timeout,
-                "ai-fix",
+                &label,
             )
             .await;
 
             match result {
                 Ok(text) => {
-                    let _ = tx.send(tui::event::AppEvent::ClaudeOutputChunk(text));
-                    let _ = tx.send(tui::event::AppEvent::ClaudeOutputDone);
+                    let _ = tx.send(tui::event::AppEvent::FixTaskChunk(task_idx, text));
+                    let _ = tx.send(tui::event::AppEvent::FixTaskDone(task_idx));
                 }
-                Err(e) => { let _ = tx.send(tui::event::AppEvent::ClaudeOutputFailed(format!("{:#}", e))); }
+                Err(e) => {
+                    let _ = tx.send(tui::event::AppEvent::FixTaskFailed(task_idx, format!("{:#}", e)));
+                }
             }
         }
     });
 }
 
-/// Stream the `claude --print` subprocess stdout line-by-line to the event channel.
-async fn stream_claude_cli(
+/// Stream the `claude --print` subprocess line-by-line, tagging each chunk with `task_idx`.
+async fn stream_claude_cli_task(
+    task_idx: usize,
     system: &str,
     prompt: &str,
     timeout_secs: u64,
@@ -1778,12 +1842,9 @@ async fn stream_claude_cli(
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to spawn `claude`: {} — is Claude Code installed and in PATH?", e))?;
 
-    // Write the prompt to stdin in a separate task so we don't block reading stdout
     if let Some(mut stdin) = child.stdin.take() {
         let bytes = prompt.as_bytes().to_vec();
-        tokio::spawn(async move {
-            let _ = stdin.write_all(&bytes).await;
-        });
+        tokio::spawn(async move { let _ = stdin.write_all(&bytes).await; });
     }
 
     let stdout = child.stdout.take()
@@ -1795,20 +1856,22 @@ async fn stream_claude_cli(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             child.kill().await.ok();
-            anyhow::bail!("'ai-fix' timed out after {}s — try increasing agents.timeout_secs in config", timeout_secs);
+            anyhow::bail!("fix-task-{} timed out after {}s — increase agents.timeout_secs in config",
+                task_idx + 1, timeout_secs);
         }
 
         match tokio::time::timeout(remaining, reader.next_line()).await {
             Ok(Ok(Some(line))) => {
-                if tx.send(tui::event::AppEvent::ClaudeOutputChunk(format!("{}\n", line))).is_err() {
-                    break; // receiver dropped — TUI exited
+                if tx.send(tui::event::AppEvent::FixTaskChunk(task_idx, format!("{line}\n"))).is_err() {
+                    break;
                 }
             }
-            Ok(Ok(None)) => break, // EOF
+            Ok(Ok(None)) => break,
             Ok(Err(e)) => return Err(e.into()),
-            Err(_elapsed) => {
+            Err(_) => {
                 child.kill().await.ok();
-                anyhow::bail!("'ai-fix' timed out after {}s — try increasing agents.timeout_secs in config", timeout_secs);
+                anyhow::bail!("fix-task-{} timed out after {}s — increase agents.timeout_secs in config",
+                    task_idx + 1, timeout_secs);
             }
         }
     }

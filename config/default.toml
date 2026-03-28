@@ -41,7 +41,7 @@ temperature = 0.2
 [agents]
 agents_dir = "~/.config/prism/agents"
 concurrency = 3
-timeout_secs = 60
+timeout_secs = 360
 
 # Files matching these glob patterns are excluded from every agent's diff.
 # Patterns are matched against the full path and every sub-path (so "dist/*"

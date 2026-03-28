@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use crate::github::models::PrDetails;
 use crate::review::models::GeneratedComment;
@@ -84,14 +85,26 @@ pub struct ReviewContext {
     /// Analysis from the Phase-0 objective-validator agent. Injected into all
     /// Phase-1 and Phase-2 agent prompts so they understand ticket alignment.
     pub objective_analysis: Option<ObjectiveAnalysis>,
+    /// `"owner/repo"` — used as the cache namespace.
+    pub repo_slug: String,
+    /// Git blob SHAs extracted from the diff: `file_path → blob_sha`.
+    /// Used by the orchestrator to decide which files need re-reviewing.
+    pub blob_shas: HashMap<String, String>,
+    /// When non-empty, `prepare_diff` restricts the diff to only these file
+    /// paths, overriding the agent's own `include_patterns`.
+    /// Set by the orchestrator for partial cache hits.
+    pub cache_skip_paths: Vec<String>,
 }
 
 impl ReviewContext {
     /// Build a `ReviewContext` from GitHub PR details + raw diff text.
-    pub fn from_pr(pr: &PrDetails, diff: &str, ticket: Option<Ticket>) -> Self {
+    ///
+    /// `repo_slug` should be `"owner/repo"` — used for cache lookup.
+    pub fn from_pr(pr: &PrDetails, diff: &str, ticket: Option<Ticket>, repo_slug: &str) -> Self {
         let raw_diff: Arc<str> = Arc::from(diff);
         let diff_stats = DiffStats::from_diff(diff);
         let changed_files = parse_changed_files(diff);
+        let blob_shas = crate::review::cache::extract_blob_shas(diff);
 
         Self {
             pr_number: pr.number,
@@ -108,6 +121,9 @@ impl ReviewContext {
             repo_language: pr.repo_language.clone(),
             prior_findings: Vec::new(),
             objective_analysis: None,
+            repo_slug: repo_slug.to_string(),
+            blob_shas,
+            cache_skip_paths: Vec::new(),
         }
     }
 
@@ -151,11 +167,19 @@ impl ReviewContext {
     ) -> PreparedDiff {
         let sections = split_diff_by_file(&self.raw_diff);
 
+        // If the orchestrator set cache_skip_paths, those files are already
+        // cached and must be excluded from the diff sent to the LLM.
+        let effective_exclude: Vec<String> = global_exclude
+            .iter()
+            .chain(self.cache_skip_paths.iter())
+            .cloned()
+            .collect();
+
         let mut included_sections: Vec<(String, String)> = Vec::new();
         let mut excluded_names: Vec<String> = Vec::new();
 
         for (path, section) in sections {
-            if should_include_file(&path, global_exclude, agent_exclude, agent_include) {
+            if should_include_file(&path, &effective_exclude, agent_exclude, agent_include) {
                 included_sections.push((path, section));
             } else {
                 excluded_names.push(path);
@@ -625,6 +649,9 @@ index 123..456 100644
             repo_language: None,
             prior_findings: vec![],
             objective_analysis: None,
+            repo_slug: "owner/repo".to_string(),
+            blob_shas: std::collections::HashMap::new(),
+            cache_skip_paths: vec![],
         };
         let prepared = ctx.prepare_diff(
             &["*.lock".to_string()],

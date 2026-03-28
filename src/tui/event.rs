@@ -29,10 +29,12 @@ pub enum AppEvent {
     ReviewsLoaded(Vec<crate::github::models::GhReview>, Vec<crate::github::models::GhPrComment>),
     QuickCommentDone,
     QuickCommentFailed(String),
-    /// Incremental text chunk streamed from the LLM during an AI-fix session.
-    ClaudeOutputChunk(String),
-    ClaudeOutputDone,
-    ClaudeOutputFailed(String),
+    /// A streaming text chunk from Claude for fix-task at `index`.
+    FixTaskChunk(usize, String),
+    /// The fix-task at `index` completed successfully.
+    FixTaskDone(usize),
+    /// The fix-task at `index` failed with the given error message.
+    FixTaskFailed(usize, String),
 }
 
 /// Spawn a background thread that polls crossterm key events.

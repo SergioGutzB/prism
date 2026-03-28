@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::agents::context::{AgentFinding, ObjectiveAnalysis, ReviewContext};
 use crate::agents::models::{AgentDefinition, AgentStatus};
 use crate::agents::runner::AgentRunner;
 use crate::config::AppConfig;
+use crate::review::cache::ReviewCache;
 
 /// Events emitted by the orchestrator during a run.
 #[derive(Debug)]
@@ -30,21 +31,21 @@ impl Orchestrator {
         }
     }
 
-    /// Run all enabled agents in three collaborative phases.
+    /// Run all enabled agents in three collaborative phases with cache support.
     ///
-    /// **Phase 0** — Objective-validator agents (`phase_zero = true`) run first,
-    /// sequentially. Their `ObjectiveAnalysis` output is injected into all later
-    /// agent contexts so every specialist knows whether the PR aligns with the
-    /// ticket objectives.
+    /// **Phase 0** — Objective-validator agents run first (sequentially).
     ///
-    /// **Phase 1** — Specialist agents (`synthesis = false`, `phase_zero = false`)
-    /// run concurrently with the enriched context.
+    /// **Phase 1** — Specialist agents run concurrently. For each agent the
+    /// orchestrator checks the on-disk review cache:
+    ///   - **Full hit** (all files cached) → emit `Skipped`, reuse cached comments.
+    ///   - **Partial hit** (some files changed) → set `cache_skip_paths` so the
+    ///     agent only processes changed files; merge new + cached comments.
+    ///   - **Miss** (no cache or all files changed) → run normally.
+    ///   After every agent its results are written back to the cache.
     ///
-    /// **Phase 2** — Synthesis agents (`synthesis = true`) run after Phase 1
-    /// completes, receiving both the objective analysis and the specialist findings.
+    /// **Phase 2** — Synthesis agents receive all Phase-1 findings (cached + new).
     ///
-    /// Status updates are emitted through the returned `mpsc::Receiver`.
-    /// The function returns immediately; the agent tasks run in the background.
+    /// The cache is saved to disk once all phases complete.
     pub fn run_all(
         &self,
         agents: Vec<AgentDefinition>,
@@ -53,6 +54,12 @@ impl Orchestrator {
         let (tx, rx) = mpsc::channel::<AgentUpdate>(256);
         let runner = Arc::clone(&self.runner);
         let concurrency = self.concurrency;
+
+        // Load (or create) the review cache for this PR
+        let cache = ReviewCache::load(ctx.pr_number, &ctx.repo_slug)
+            .unwrap_or_else(|| ReviewCache::new(ctx.pr_number, &ctx.repo_slug));
+        let cache = Arc::new(Mutex::new(cache));
+
         let ctx = Arc::new(ctx);
 
         tokio::spawn(async move {
@@ -82,7 +89,7 @@ impl Orchestrator {
                 }).await;
             }
 
-            // Emit Pending for all enabled agents (all phases)
+            // Emit Pending for all enabled agents
             for agent in phase_zero.iter().chain(specialists.iter()).chain(synthesis.iter()) {
                 let _ = tx.send(AgentUpdate {
                     agent_id: agent.agent.id.clone(),
@@ -107,12 +114,13 @@ impl Orchestrator {
                 Arc::clone(&ctx)
             };
 
-            // ── Phase 1: specialist agents ─────────────────────────────────
-            let phase1_findings = run_phase(
+            // ── Phase 1: specialist agents (cache-aware) ───────────────────
+            let phase1_findings = run_phase_cached(
                 specialists,
                 Arc::clone(&ctx1),
                 Arc::clone(&runner),
                 concurrency,
+                Arc::clone(&cache),
                 &tx,
             ).await;
 
@@ -122,14 +130,11 @@ impl Orchestrator {
                 ctx2.prior_findings = phase1_findings;
                 let ctx2 = Arc::new(ctx2);
 
-                run_phase(
-                    synthesis,
-                    ctx2,
-                    Arc::clone(&runner),
-                    concurrency,
-                    &tx,
-                ).await;
+                run_phase(synthesis, ctx2, Arc::clone(&runner), concurrency, &tx).await;
             }
+
+            // Persist the updated cache to disk
+            cache.lock().await.save();
 
             info!("All agents completed");
         });
@@ -138,10 +143,8 @@ impl Orchestrator {
     }
 }
 
-/// Run Phase-0 objective-validator agents sequentially.
-///
-/// There will typically be just one, but the design allows for multiple.
-/// Returns the last successful `ObjectiveAnalysis`.
+// ── Phase 0 ───────────────────────────────────────────────────────────────────
+
 async fn run_phase_zero(
     agents: Vec<AgentDefinition>,
     ctx: Arc<ReviewContext>,
@@ -162,12 +165,8 @@ async fn run_phase_zero(
         let (status, analysis) = runner.run_objective(&agent, &ctx).await;
 
         if let AgentStatus::Done { ref comments, elapsed_ms, .. } = status {
-            info!(
-                agent_id = %agent_id,
-                comment_count = comments.len(),
-                elapsed_ms = elapsed_ms,
-                "Phase-0 agent done"
-            );
+            info!(agent_id = %agent_id, comment_count = comments.len(),
+                  elapsed_ms, "Phase-0 agent done");
         } else if let AgentStatus::Failed { ref error } = status {
             error!(agent_id = %agent_id, error = %error, "Phase-0 agent failed");
         }
@@ -182,9 +181,176 @@ async fn run_phase_zero(
     last_analysis
 }
 
-/// Run a list of agents concurrently (up to `concurrency` at once).
-///
-/// Returns the aggregated specialist findings for Phase-2 context enrichment.
+// ── Phase 1 (cache-aware) ─────────────────────────────────────────────────────
+
+/// Run specialist agents concurrently, consulting the cache before each run.
+async fn run_phase_cached(
+    agents: Vec<AgentDefinition>,
+    ctx: Arc<ReviewContext>,
+    runner: Arc<AgentRunner>,
+    concurrency: usize,
+    cache: Arc<Mutex<ReviewCache>>,
+    tx: &mpsc::Sender<AgentUpdate>,
+) -> Vec<AgentFinding> {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut join_set = JoinSet::new();
+
+    for agent in agents {
+        let permit     = Arc::clone(&semaphore);
+        let runner     = Arc::clone(&runner);
+        let ctx        = Arc::clone(&ctx);
+        let cache      = Arc::clone(&cache);
+        let tx         = tx.clone();
+
+        join_set.spawn(async move {
+            let _permit    = permit.acquire_owned().await;
+            let agent_id   = agent.agent.id.clone();
+            let agent_name = agent.agent.name.clone();
+            let agent_icon = agent.agent.icon.clone();
+
+            // ── Check cache before running ─────────────────────────────
+            let blob_shas  = ctx.blob_shas.clone();
+            let cache_hits = {
+                let c = cache.lock().await;
+                c.hits_for_agent(&agent_id, &blob_shas)
+            };
+
+            // Files in the diff that this agent could review (filtered by agent
+            // patterns but not yet by the cache)
+            let diff_files: Vec<String> = ctx.blob_shas.keys().cloned().collect();
+            let uncached: Vec<String> = diff_files
+                .iter()
+                .filter(|f| !cache_hits.contains(f))
+                .cloned()
+                .collect();
+
+            debug!(
+                agent_id = %agent_id,
+                total = diff_files.len(),
+                cached = cache_hits.len(),
+                uncached = uncached.len(),
+                "Cache check"
+            );
+
+            // ── Full cache hit — skip LLM call ─────────────────────────
+            if uncached.is_empty() && !diff_files.is_empty() {
+                let cached_comments = {
+                    let c = cache.lock().await;
+                    c.valid_comments_for_agent(&agent_id, &blob_shas)
+                };
+                let comment_count  = cached_comments.len();
+                let reason = format!(
+                    "{} file(s) from cache, 0 tokens used",
+                    cache_hits.len()
+                );
+                info!(agent_id = %agent_id, comment_count, "Full cache hit — skipping LLM");
+
+                let _ = tx.send(AgentUpdate {
+                    agent_id: agent_id.clone(),
+                    status: AgentStatus::Skipped { reason: reason.clone() },
+                }).await;
+
+                return Some(AgentFinding {
+                    agent_id,
+                    agent_name,
+                    agent_icon,
+                    comments: cached_comments,
+                });
+            }
+
+            // ── Partial or full miss — run the agent ───────────────────
+            // Build a context that skips already-cached files
+            let run_ctx: Arc<ReviewContext> = if cache_hits.is_empty() {
+                Arc::clone(&ctx)
+            } else {
+                let mut c = (*ctx).clone();
+                c.cache_skip_paths = cache_hits.clone();
+                Arc::new(c)
+            };
+
+            let _ = tx.send(AgentUpdate {
+                agent_id: agent_id.clone(),
+                status: AgentStatus::Running { started_at: chrono::Utc::now() },
+            }).await;
+
+            let status = runner.run(&agent, &run_ctx).await;
+
+            let finding = match &status {
+                AgentStatus::Done { comments, elapsed_ms, .. } => {
+                    info!(
+                        agent_id = %agent_id,
+                        comment_count = comments.len(),
+                        cached_files  = cache_hits.len(),
+                        elapsed_ms,
+                        "Agent done"
+                    );
+
+                    // Save new results to cache
+                    {
+                        let mut c = cache.lock().await;
+                        c.put_agent_results(&agent_id, comments, &blob_shas);
+                    }
+
+                    // Merge new comments with previously-cached ones
+                    let mut all_comments = comments.clone();
+                    if !cache_hits.is_empty() {
+                        let cached = {
+                            let c = cache.lock().await;
+                            c.valid_comments_for_agent(&agent_id, &blob_shas)
+                        };
+                        // Avoid double-counting the new comments we just saved
+                        let new_paths: std::collections::HashSet<_> = comments
+                            .iter()
+                            .filter_map(|c| c.file_path.as_deref())
+                            .collect();
+                        let extra: Vec<_> = cached
+                            .into_iter()
+                            .filter(|c| {
+                                c.file_path
+                                    .as_deref()
+                                    .map(|p| !new_paths.contains(p))
+                                    .unwrap_or(true)
+                            })
+                            .collect();
+                        all_comments.extend(extra);
+                        warn!(
+                            agent_id = %agent_id,
+                            merged_from_cache = cache_hits.len(),
+                            "Merged cached comments with new agent results"
+                        );
+                    }
+
+                    Some(AgentFinding {
+                        agent_id: agent_id.clone(),
+                        agent_name,
+                        agent_icon,
+                        comments: all_comments,
+                    })
+                }
+                AgentStatus::Failed { error } => {
+                    error!(agent_id = %agent_id, error = %error, "Agent failed");
+                    None
+                }
+                _ => None,
+            };
+
+            let _ = tx.send(AgentUpdate { agent_id, status }).await;
+            finding
+        });
+    }
+
+    let mut findings: Vec<AgentFinding> = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        if let Ok(Some(finding)) = result {
+            findings.push(finding);
+        }
+    }
+    findings.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    findings
+}
+
+// ── Phase 2 (synthesis, no cache) ────────────────────────────────────────────
+
 async fn run_phase(
     agents: Vec<AgentDefinition>,
     ctx: Arc<ReviewContext>,
@@ -196,14 +362,14 @@ async fn run_phase(
     let mut join_set = JoinSet::new();
 
     for agent in agents {
-        let permit = Arc::clone(&semaphore);
-        let runner = Arc::clone(&runner);
-        let ctx = Arc::clone(&ctx);
-        let tx = tx.clone();
+        let permit     = Arc::clone(&semaphore);
+        let runner     = Arc::clone(&runner);
+        let ctx        = Arc::clone(&ctx);
+        let tx         = tx.clone();
 
         join_set.spawn(async move {
-            let _permit = permit.acquire_owned().await;
-            let agent_id = agent.agent.id.clone();
+            let _permit    = permit.acquire_owned().await;
+            let agent_id   = agent.agent.id.clone();
             let agent_name = agent.agent.name.clone();
             let agent_icon = agent.agent.icon.clone();
 
@@ -216,15 +382,10 @@ async fn run_phase(
 
             let status = runner.run(&agent, &ctx).await;
 
-            // Extract comments for Phase-2 findings aggregation
             let finding = match &status {
                 AgentStatus::Done { comments, elapsed_ms, .. } => {
-                    info!(
-                        agent_id = %agent_id,
-                        comment_count = comments.len(),
-                        elapsed_ms = elapsed_ms,
-                        "Agent done"
-                    );
+                    info!(agent_id = %agent_id, comment_count = comments.len(),
+                          elapsed_ms, "Agent done");
                     Some(AgentFinding {
                         agent_id: agent_id.clone(),
                         agent_name,
@@ -244,15 +405,12 @@ async fn run_phase(
         });
     }
 
-    // Collect results preserving agent order
     let mut findings: Vec<AgentFinding> = Vec::new();
     while let Some(result) = join_set.join_next().await {
         if let Ok(Some(finding)) = result {
             findings.push(finding);
         }
     }
-
-    // Sort by agent_id so the synthesis prompt is deterministic
     findings.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     findings
 }

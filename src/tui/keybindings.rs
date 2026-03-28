@@ -145,6 +145,7 @@ pub enum Action {
     ShowStats,
     RunMissingAgents,
     RestartReview,
+    ClearCache,
     Char(char),
     FilterAgent(u8),
     ClaudeCodeFix,
@@ -224,6 +225,7 @@ pub fn map_key(key: &KeyEvent, mode: &InputMode) -> Option<Action> {
                 KeyCode::Char('T') => Some(Action::ShowStats),
                 KeyCode::Char('R') => Some(Action::RestartReview),
                 KeyCode::Char('C') => Some(Action::ClaudeCodeFix),
+                KeyCode::Char('X') => Some(Action::ClearCache),
                 // Filter by agent number (1-7)
                 KeyCode::Char(c @ '1'..='7') => {
                     Some(Action::FilterAgent(c as u8 - b'0'))

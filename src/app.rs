@@ -67,6 +67,34 @@ pub enum PendingPublish {
     RunMissingAgents,
 }
 
+/// Status of a single AI-fix task (one per review comment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixTaskStatus {
+    Pending,
+    Running,
+    Done,
+    Failed(String),
+}
+
+/// One item in the AI-fix task list — corresponds to a single review comment
+/// that Claude will apply to the codebase.
+#[derive(Debug, Clone)]
+pub struct FixTask {
+    /// 1-based display index shown in the UI.
+    pub index: usize,
+    /// Location string: "src/foo.rs:42" or "(general)".
+    pub location: String,
+    /// Source agent name or "Manual".
+    pub source: String,
+    /// Truncated first line of the comment body shown in the task list.
+    pub summary: String,
+    pub status: FixTaskStatus,
+    /// Accumulated streaming output from Claude for this task.
+    pub output: String,
+    /// The full prompt sent to Claude — stored for per-task retry.
+    pub prompt: String,
+}
+
 /// Global application state — all mutable state lives here.
 pub struct App {
     pub screen: Screen,
@@ -166,12 +194,15 @@ pub struct App {
     pub token_output_total: u64,
     pub token_calls_total: u64,
 
-    // Claude Code output screen state
-    pub claude_output: String,
+    // Claude Code AI-fix screen state
+    /// Ordered list of per-comment fix tasks.
+    pub fix_tasks: Vec<FixTask>,
+    /// Index of the task currently visible in the output panel.
+    pub fix_task_selected: usize,
+    /// Scroll offset for the output panel of the selected task.
     pub claude_output_scroll: usize,
+    /// True while any fix task is pending or running.
     pub claude_output_loading: bool,
-    /// Stored prompt for the last AI-fix run — used to retry on demand.
-    pub claude_fix_prompt: String,
 
     // Setup wizard state
     pub setup_gh_token: String,       // token detected from gh CLI
@@ -238,10 +269,10 @@ impl App {
             token_input_total: 0,
             token_output_total: 0,
             token_calls_total: 0,
-            claude_output: String::new(),
+            fix_tasks: Vec::new(),
+            fix_task_selected: 0,
             claude_output_scroll: 0,
             claude_output_loading: false,
-            claude_fix_prompt: String::new(),
             setup_gh_token: String::new(),
             setup_owner: String::new(),
             setup_repo: String::new(),
