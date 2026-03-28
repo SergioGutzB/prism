@@ -6,6 +6,9 @@ pub struct Ticket {
     pub key: String,
     pub title: String,
     pub description: Option<String>,
+    /// Acceptance criteria extracted from the ticket description or a dedicated
+    /// custom field. Used by the Objective Validator agent to validate alignment.
+    pub acceptance_criteria: Option<String>,
     pub status: String,
     pub ticket_type: String,
     pub priority: Option<String>,
@@ -30,6 +33,9 @@ impl Ticket {
         }
         if let Some(desc) = &self.description {
             parts.push(format!("\nDescription:\n{}", desc));
+        }
+        if let Some(ac) = &self.acceptance_criteria {
+            parts.push(format!("\nAcceptance Criteria:\n{}", ac));
         }
         if !self.labels.is_empty() {
             parts.push(format!("Labels: {}", self.labels.join(", ")));

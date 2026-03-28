@@ -18,6 +18,15 @@ pub struct AgentMeta {
     pub llm: Option<AgentLlmOverride>,
     pub prompt: AgentPrompt,
     pub context: AgentContext,
+    /// Phase 0: runs BEFORE specialist agents. Receives full context but no
+    /// prior findings. Its output (ObjectiveAnalysis) is injected into all
+    /// later agents. Use for objective-validation agents. Default: false.
+    #[serde(default)]
+    pub phase_zero: bool,
+    /// Phase 2: runs AFTER all specialist agents and receives their aggregated
+    /// findings as additional context. Use for synthesis/summary agents. Default: false.
+    #[serde(default)]
+    pub synthesis: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

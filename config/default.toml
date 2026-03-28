@@ -42,8 +42,34 @@ temperature = 0.2
 agents_dir = "~/.config/prism/agents"
 concurrency = 3
 timeout_secs = 60
-diff_exclude_patterns = ["*.lock", "package-lock.json", "yarn.lock", "*.generated.*", "dist/*", "build/*"]
-max_diff_tokens = 8000
+
+# Files matching these glob patterns are excluded from every agent's diff.
+# Patterns are matched against the full path and every sub-path (so "dist/*"
+# also matches "frontend/dist/bundle.js"). Supports '*' wildcard only.
+# Per-agent exclude_patterns in the agent TOML are merged on top of this list.
+diff_exclude_patterns = [
+  "*.lock",
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "*.generated.*",
+  "*.min.js",
+  "*.min.css",
+  "dist/*",
+  "build/*",
+  "vendor/*",
+  "node_modules/*",
+  "__generated__/*",
+  "*.pb.go",
+  "*.pb.ts",
+  "*.snap",
+]
+
+# Maximum diff tokens per agent. Files are truncated at clean file boundaries
+# (never mid-hunk). Because the global exclude patterns remove noise files first,
+# the effective diff seen by the LLM is typically much smaller.
+max_diff_tokens = 12000
+
 # Review strictness: "critical_only" | "strict" | "moderate" | "light"
 review_rigor = "moderate"
 

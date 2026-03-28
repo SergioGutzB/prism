@@ -29,7 +29,9 @@ pub enum AppEvent {
     ReviewsLoaded(Vec<crate::github::models::GhReview>, Vec<crate::github::models::GhPrComment>),
     QuickCommentDone,
     QuickCommentFailed(String),
-    ClaudeOutputDone(String),
+    /// Incremental text chunk streamed from the LLM during an AI-fix session.
+    ClaudeOutputChunk(String),
+    ClaudeOutputDone,
     ClaudeOutputFailed(String),
 }
 

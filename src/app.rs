@@ -170,6 +170,8 @@ pub struct App {
     pub claude_output: String,
     pub claude_output_scroll: usize,
     pub claude_output_loading: bool,
+    /// Stored prompt for the last AI-fix run — used to retry on demand.
+    pub claude_fix_prompt: String,
 
     // Setup wizard state
     pub setup_gh_token: String,       // token detected from gh CLI
@@ -239,6 +241,7 @@ impl App {
             claude_output: String::new(),
             claude_output_scroll: 0,
             claude_output_loading: false,
+            claude_fix_prompt: String::new(),
             setup_gh_token: String::new(),
             setup_owner: String::new(),
             setup_repo: String::new(),

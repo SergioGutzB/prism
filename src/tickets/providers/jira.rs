@@ -75,11 +75,14 @@ impl TicketProvider for JiraProvider {
         let issue: JiraIssue = response.json().await.context("Failed to parse Jira issue")?;
 
         let description = extract_jira_description(&issue.fields.description);
+        let acceptance_criteria = description.as_deref()
+            .and_then(extract_acceptance_criteria);
 
         Ok(Some(Ticket {
             key: issue.key.clone(),
             title: issue.fields.summary,
             description,
+            acceptance_criteria,
             status: issue
                 .fields
                 .status
@@ -193,4 +196,45 @@ fn collect_adf_text(node: &serde_json::Value, out: &mut String) {
         }
         out.push('\n');
     }
+}
+
+/// Scan the plain-text description for a common acceptance criteria section marker
+/// and return everything after it until the next blank section or 2000 chars.
+///
+/// Recognises (case-insensitive):
+/// - "Acceptance Criteria", "AC:", "Criterios de Aceptación/Aceptacion"
+/// - "Definition of Done", "DoD:"
+fn extract_acceptance_criteria(description: &str) -> Option<String> {
+    const MARKERS: &[&str] = &[
+        "acceptance criteria",
+        "acceptance criteria:",
+        "criterios de aceptación",
+        "criterios de aceptacion",
+        "criterios de aceptación:",
+        "criterios de aceptacion:",
+        "definition of done",
+        "definition of done:",
+        "dod:",
+        "ac:",
+    ];
+
+    let lower = description.to_lowercase();
+
+    for marker in MARKERS {
+        if let Some(pos) = lower.find(marker) {
+            let after = &description[pos + marker.len()..];
+            // Skip punctuation / whitespace / the rest of the heading line
+            let after = after.trim_start_matches([' ', '\t', ':', '\n', '\r']);
+            // Limit to 2000 chars; stop at a blank line triple (new major section)
+            let limit = after.len().min(2000);
+            let end = after[..limit]
+                .find("\n\n\n")
+                .unwrap_or(limit);
+            let ac = after[..end].trim().to_string();
+            if !ac.is_empty() {
+                return Some(ac);
+            }
+        }
+    }
+    None
 }

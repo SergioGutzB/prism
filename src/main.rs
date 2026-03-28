@@ -305,15 +305,22 @@ async fn main() -> Result<()> {
                         app.show_error(format!("Failed to post comment: {}", msg));
                     }
 
-                    AppEvent::ClaudeOutputDone(output) => {
-                        app.claude_output = output;
+                    AppEvent::ClaudeOutputChunk(chunk) => {
+                        app.claude_output.push_str(&chunk);
+                        // Auto-scroll to bottom while loading
+                        if app.claude_output_loading {
+                            let line_count = app.claude_output.lines().count();
+                            app.claude_output_scroll = line_count.saturating_sub(1);
+                        }
+                    }
+
+                    AppEvent::ClaudeOutputDone => {
                         app.claude_output_loading = false;
-                        app.claude_output_scroll = 0;
                     }
 
                     AppEvent::ClaudeOutputFailed(msg) => {
                         app.claude_output_loading = false;
-                        app.claude_output = format!("❌ Claude Code failed:\n\n{}", msg);
+                        app.claude_output.push_str(&format!("\n\n❌ Failed: {}", msg));
                     }
                 }
             }
@@ -780,8 +787,9 @@ async fn handle_action(
         Action::ClaudeCodeFix => {
             if app.screen == Screen::DoubleCheck {
                 send_to_claude_code(app, event_tx, config);
-            } else if app.screen == Screen::ClaudeCodeOutput {
-                // jk scrolling handled by NavUp/NavDown — nothing extra needed here
+            } else if app.screen == Screen::ClaudeCodeOutput && !app.claude_output_loading {
+                // Retry the last job from the output screen
+                retry_claude_fix(app, event_tx, config);
             }
         }
 
@@ -1670,15 +1678,40 @@ fn build_claude_fix_prompt(app: &App) -> String {
 }
 
 /// Spawn a Claude Code subprocess with the review task and send results via event channel.
+/// Stores the prompt in `app.claude_fix_prompt` so the user can retry.
 fn send_to_claude_code(
     app: &mut App,
     tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
     config: &config::AppConfig,
 ) {
     let prompt = build_claude_fix_prompt(app);
+    spawn_claude_fix(app, tx, config, prompt);
+}
+
+/// Re-run the last AI-fix job using the previously built prompt.
+fn retry_claude_fix(
+    app: &mut App,
+    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
+    config: &config::AppConfig,
+) {
+    if app.claude_fix_prompt.is_empty() {
+        return;
+    }
+    let prompt = app.claude_fix_prompt.clone();
+    spawn_claude_fix(app, tx, config, prompt);
+}
+
+fn spawn_claude_fix(
+    app: &mut App,
+    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
+    config: &config::AppConfig,
+    prompt: String,
+) {
+    app.claude_fix_prompt = prompt.clone();
     let tx = tx.clone();
     let llm = config.llm.clone();
-    let timeout = config.agents.timeout_secs.max(120); // at least 2 min for this task
+    // At least 5 minutes — AI-fix tasks can be large
+    let timeout = config.agents.timeout_secs.max(300);
 
     app.claude_output = String::new();
     app.claude_output_scroll = 0;
@@ -1689,25 +1722,99 @@ fn send_to_claude_code(
         let system = "You are a senior software engineer performing code review corrections. \
             Respond with concrete, actionable code changes. Be precise about file paths and line numbers.";
 
-        let client = reqwest::Client::new();
-        let result = agents::runner::call_provider(
-            &client,
-            &llm,
-            &llm.model.clone(),
-            llm.temperature,
-            llm.max_tokens,
-            system,
-            &prompt,
-            timeout,
-            "ai-fix",
-        )
-        .await;
+        let is_cli = matches!(llm.provider.as_str(), "claude-cli" | "claude");
 
-        match result {
-            Ok(text) => { let _ = tx.send(tui::event::AppEvent::ClaudeOutputDone(text)); }
-            Err(e)   => { let _ = tx.send(tui::event::AppEvent::ClaudeOutputFailed(format!("{:#}", e))); }
+        if is_cli {
+            // Stream stdout line-by-line so the user sees progress in real time
+            match stream_claude_cli(system, &prompt, timeout, &tx).await {
+                Ok(()) => { let _ = tx.send(tui::event::AppEvent::ClaudeOutputDone); }
+                Err(e) => { let _ = tx.send(tui::event::AppEvent::ClaudeOutputFailed(format!("{:#}", e))); }
+            }
+        } else {
+            // API providers: collect full response then emit as one chunk
+            let client = reqwest::Client::new();
+            let result = agents::runner::call_provider(
+                &client,
+                &llm,
+                &llm.model.clone(),
+                llm.temperature,
+                llm.max_tokens,
+                system,
+                &prompt,
+                timeout,
+                "ai-fix",
+            )
+            .await;
+
+            match result {
+                Ok(text) => {
+                    let _ = tx.send(tui::event::AppEvent::ClaudeOutputChunk(text));
+                    let _ = tx.send(tui::event::AppEvent::ClaudeOutputDone);
+                }
+                Err(e) => { let _ = tx.send(tui::event::AppEvent::ClaudeOutputFailed(format!("{:#}", e))); }
+            }
         }
     });
+}
+
+/// Stream the `claude --print` subprocess stdout line-by-line to the event channel.
+async fn stream_claude_cli(
+    system: &str,
+    prompt: &str,
+    timeout_secs: u64,
+    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
+) -> anyhow::Result<()> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::Command;
+
+    let mut child = Command::new("claude")
+        .arg("--print")
+        .arg("--system-prompt")
+        .arg(system)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn `claude`: {} — is Claude Code installed and in PATH?", e))?;
+
+    // Write the prompt to stdin in a separate task so we don't block reading stdout
+    if let Some(mut stdin) = child.stdin.take() {
+        let bytes = prompt.as_bytes().to_vec();
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&bytes).await;
+        });
+    }
+
+    let stdout = child.stdout.take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to capture claude stdout"))?;
+    let mut reader = BufReader::new(stdout).lines();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            child.kill().await.ok();
+            anyhow::bail!("'ai-fix' timed out after {}s — try increasing agents.timeout_secs in config", timeout_secs);
+        }
+
+        match tokio::time::timeout(remaining, reader.next_line()).await {
+            Ok(Ok(Some(line))) => {
+                if tx.send(tui::event::AppEvent::ClaudeOutputChunk(format!("{}\n", line))).is_err() {
+                    break; // receiver dropped — TUI exited
+                }
+            }
+            Ok(Ok(None)) => break, // EOF
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_elapsed) => {
+                child.kill().await.ok();
+                anyhow::bail!("'ai-fix' timed out after {}s — try increasing agents.timeout_secs in config", timeout_secs);
+            }
+        }
+    }
+
+    child.wait().await.ok();
+    Ok(())
 }
 
 // ── GitHub API calls ───────────────────────────────────────────────────────

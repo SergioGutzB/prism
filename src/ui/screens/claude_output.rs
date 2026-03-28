@@ -94,14 +94,19 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 
     // ── Keybind bar ───────────────────────────────────────────────────────────
-    keybind_bar::render(
-        frame,
-        chunks[2],
-        &[
+    let retry_hint = if !app.claude_output_loading && !app.claude_fix_prompt.is_empty() {
+        vec![
             ("[Esc]", "Back"),
             ("[jk]", "Scroll"),
             ("[G/gg]", "Bottom/Top"),
-        ],
-        &t,
-    );
+            ("[C]", "Retry"),
+        ]
+    } else {
+        vec![
+            ("[Esc]", "Back"),
+            ("[jk]", "Scroll"),
+            ("[G/gg]", "Bottom/Top"),
+        ]
+    };
+    keybind_bar::render(frame, chunks[2], &retry_hint, &t);
 }

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use crate::agents::context::ReviewContext;
+use crate::agents::context::{ObjectiveAlignment, ObjectiveAnalysis, ReviewContext};
 use crate::agents::models::{AgentDefinition, AgentStatus};
 use crate::config::AppConfig;
 use crate::review::models::{CommentSource, GeneratedComment, Severity};
@@ -25,6 +25,16 @@ struct RawSummary {
     severity: Option<String>,
 }
 
+/// Objective-validator agent (Phase 0) returns this shape.
+#[derive(Debug, Deserialize)]
+struct RawObjective {
+    stated_objectives: String,
+    implementation_summary: String,
+    alignment: String,
+    gaps: Option<Vec<String>>,
+    overall_assessment: String,
+}
+
 pub struct AgentRunner {
     config: AppConfig,
     /// Shared HTTP client for API-based providers.
@@ -37,6 +47,85 @@ impl AgentRunner {
             config,
             client: reqwest::Client::new(),
         }
+    }
+
+    /// Execute a Phase-0 objective-validator agent.
+    ///
+    /// Returns the `AgentStatus` (for UI updates) **and** the structured
+    /// `ObjectiveAnalysis` that will be injected into all later agents.
+    pub async fn run_objective(
+        &self,
+        agent: &AgentDefinition,
+        ctx: &ReviewContext,
+    ) -> (AgentStatus, Option<ObjectiveAnalysis>) {
+        if !agent.agent.enabled {
+            return (AgentStatus::Disabled, None);
+        }
+
+        let start = Instant::now();
+        match self.run_objective_inner(agent, ctx).await {
+            Ok((analysis, comments, input_tokens, output_tokens)) => {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                (
+                    AgentStatus::Done { comments, elapsed_ms, input_tokens, output_tokens },
+                    Some(analysis),
+                )
+            }
+            Err(e) => (AgentStatus::Failed { error: format!("{:#}", e) }, None),
+        }
+    }
+
+    async fn run_objective_inner(
+        &self,
+        agent: &AgentDefinition,
+        ctx: &ReviewContext,
+    ) -> Result<(ObjectiveAnalysis, Vec<GeneratedComment>, u64, u64)> {
+        let prompt = self.build_prompt(agent, ctx);
+        let system_len = agent.agent.prompt.system.len();
+        debug!(agent_id = %agent.agent.id, prompt_len = prompt.len(), "Running Phase-0 objective agent");
+
+        let raw_response = self.call_llm(agent, &prompt).await?;
+
+        let input_tokens = ((system_len + prompt.len()) / 4) as u64;
+        let output_tokens = (raw_response.len() / 4) as u64;
+
+        let json_str = strip_markdown_fences(&raw_response);
+        let raw: RawObjective = serde_json::from_str(json_str)
+            .context("Failed to parse objective analysis JSON")?;
+
+        let alignment = match raw.alignment.to_lowercase().trim() {
+            "aligned"    => ObjectiveAlignment::Aligned,
+            "misaligned" => ObjectiveAlignment::Misaligned,
+            _            => ObjectiveAlignment::Partial,
+        };
+
+        let analysis = ObjectiveAnalysis {
+            stated_objectives: raw.stated_objectives,
+            implementation_summary: raw.implementation_summary,
+            alignment,
+            gaps: raw.gaps.unwrap_or_default(),
+            overall_assessment: raw.overall_assessment.clone(),
+        };
+
+        // Generate a single comment for UI display
+        let sev = match analysis.alignment {
+            ObjectiveAlignment::Misaligned => Severity::Warning,
+            ObjectiveAlignment::Partial    => Severity::Suggestion,
+            ObjectiveAlignment::Aligned    => Severity::Praise,
+        };
+        let comment = GeneratedComment::new(
+            CommentSource::Agent {
+                agent_id: agent.agent.id.clone(),
+                agent_name: agent.agent.name.clone(),
+                agent_icon: agent.agent.icon.clone(),
+            },
+            raw.overall_assessment,
+            sev,
+            None,
+            None,
+        );
+
+        Ok((analysis, vec![comment], input_tokens, output_tokens))
     }
 
     /// Execute a single agent against the given review context.
@@ -97,6 +186,11 @@ impl AgentRunner {
                 ctx.pr_title, ctx.pr_number, ctx.pr_author, ctx.pr_description
             ));
         }
+        // Inject Phase-0 objective analysis so every later agent knows the
+        // stated objectives and alignment verdict.
+        if let Some(obj_text) = ctx.objective_text() {
+            parts.push(obj_text);
+        }
         if agent.agent.context.include_ticket {
             if let Some(ticket) = &ctx.ticket {
                 parts.push(format!(
@@ -108,9 +202,43 @@ impl AgentRunner {
         if agent.agent.context.include_file_list {
             parts.push(format!("## Changed Files\n\n{}", ctx.file_list_text()));
         }
+        // Phase 2 synthesis agents receive the aggregated specialist findings
+        if let Some(findings_md) = ctx.findings_text() {
+            parts.push(format!("## Team Findings\n\n{}", findings_md));
+        }
         if agent.agent.context.include_diff {
-            let diff = ctx.truncated_diff(self.config.agents.max_diff_tokens);
-            parts.push(format!("## Diff\n\n```diff\n{}\n```", diff));
+            let prepared = ctx.prepare_diff(
+                &self.config.agents.diff_exclude_patterns,
+                &agent.agent.context.exclude_patterns,
+                &agent.agent.context.include_patterns,
+                self.config.agents.max_diff_tokens,
+            );
+
+            debug!(
+                agent_id = %agent.agent.id,
+                files_included = prepared.files_included,
+                files_excluded = prepared.files_excluded,
+                files_truncated = prepared.files_truncated,
+                est_tokens = prepared.estimated_tokens(),
+                "Diff prepared for agent",
+            );
+
+            let diff_section = if prepared.diff.is_empty() {
+                // Everything was filtered — tell the LLM so it doesn't hallucinate
+                let note = prepared.header_note()
+                    .unwrap_or_else(|| "all files were excluded".to_string());
+                format!("## Diff\n\n> Note: {note}\n\n(No diff content — all changed files matched exclusion patterns.)")
+            } else {
+                match prepared.header_note() {
+                    Some(note) => format!(
+                        "## Diff\n> Note: {note}\n\n```diff\n{}\n```",
+                        prepared.diff
+                    ),
+                    None => format!("## Diff\n\n```diff\n{}\n```", prepared.diff),
+                }
+            };
+
+            parts.push(diff_section);
         }
         parts.push(agent.agent.prompt.prompt_suffix.clone());
         parts.join("\n\n")
