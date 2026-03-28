@@ -101,14 +101,32 @@ pub struct GhUser {
     pub login: String,
 }
 
+/// State of an existing GitHub review.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GhReviewState {
+    Approved,
+    ChangesRequested,
+    Commented,
+    Dismissed,
+    #[serde(other)]
+    Unknown,
+}
+
 /// A review fetched from GitHub (existing review on PR).
 #[derive(Debug, Clone, Deserialize)]
 pub struct GhReview {
     pub id: u64,
     pub user: GhUser,
     pub body: String,
-    pub state: String,  // "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"
+    pub state: GhReviewState,
     pub submitted_at: Option<DateTime<Utc>>,
+}
+
+/// Typed response for the /user endpoint.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CurrentUser {
+    pub login: String,
 }
 
 /// An existing inline PR review comment from GitHub.

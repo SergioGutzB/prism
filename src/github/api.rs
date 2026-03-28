@@ -3,7 +3,8 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::github::client::GitHubClient;
-use crate::github::models::{GhPr, GhPrComment, GhReview, PrDetails, PrState, PrSummary, ReviewRequest};
+use tracing::warn;
+use crate::github::models::{CurrentUser, GhPr, GhPrComment, GhReview, PrDetails, PrState, PrSummary, ReviewRequest};
 
 pub struct GitHubApi {
     client: GitHubClient,
@@ -173,11 +174,13 @@ impl GitHubApi {
         if !response.status().is_success() {
             anyhow::bail!("Could not fetch GitHub user");
         }
-        let data: serde_json::Value = response.json().await?;
-        Ok(data["login"].as_str().unwrap_or("unknown").to_string())
+        let user: CurrentUser = response.json().await
+            .context("Failed to parse current user response")?;
+        Ok(user.login)
     }
 
     /// List existing reviews for a PR.
+    /// NOTE: capped at 100 results — PRs with >100 reviews will return partial data.
     pub async fn list_reviews(&self, pr_number: u64) -> Result<Vec<GhReview>> {
         let url = format!(
             "{}/repos/{}/{}/pulls/{}/reviews?per_page=100",
@@ -187,12 +190,14 @@ impl GitHubApi {
         let response = self.client.client.get(&url).send().await
             .context("Failed to fetch PR reviews")?;
         if !response.status().is_success() {
-            return Ok(Vec::new()); // non-critical, return empty
+            warn!("list_reviews returned {} for PR #{} — returning empty", response.status(), pr_number);
+            return Ok(Vec::new());
         }
         response.json().await.context("Failed to parse reviews")
     }
 
     /// List existing inline review comments for a PR.
+    /// NOTE: capped at 100 results — PRs with >100 inline comments will return partial data.
     pub async fn list_inline_comments(&self, pr_number: u64) -> Result<Vec<GhPrComment>> {
         let url = format!(
             "{}/repos/{}/{}/pulls/{}/comments?per_page=100",
@@ -202,6 +207,7 @@ impl GitHubApi {
         let response = self.client.client.get(&url).send().await
             .context("Failed to fetch PR comments")?;
         if !response.status().is_success() {
+            warn!("list_inline_comments returned {} for PR #{} — returning empty", response.status(), pr_number);
             return Ok(Vec::new());
         }
         response.json().await.context("Failed to parse PR comments")

@@ -218,9 +218,9 @@ async fn main() -> Result<()> {
                         // Add existing reviews as comments (only non-empty body reviews)
                         for review in &reviews {
                             if review.body.trim().is_empty() { continue; }
-                            let severity = match review.state.as_str() {
-                                "CHANGES_REQUESTED" => Severity::Warning,
-                                "APPROVED" => Severity::Praise,
+                            let severity = match review.state {
+                                github::models::GhReviewState::ChangesRequested => Severity::Warning,
+                                github::models::GhReviewState::Approved => Severity::Praise,
                                 _ => Severity::Suggestion,
                             };
                             let mut comment = GeneratedComment::new(
@@ -303,6 +303,17 @@ async fn main() -> Result<()> {
 
                     AppEvent::QuickCommentFailed(msg) => {
                         app.show_error(format!("Failed to post comment: {}", msg));
+                    }
+
+                    AppEvent::ClaudeOutputDone(output) => {
+                        app.claude_output = output;
+                        app.claude_output_loading = false;
+                        app.claude_output_scroll = 0;
+                    }
+
+                    AppEvent::ClaudeOutputFailed(msg) => {
+                        app.claude_output_loading = false;
+                        app.claude_output = format!("❌ Claude Code failed:\n\n{}", msg);
                     }
                 }
             }
@@ -395,15 +406,32 @@ async fn handle_action(
                             Some(PendingPublish::FullReview) => {
                                 publish_review(app, event_tx, config).await;
                             }
-                            None => {}
+                            _ => {}
+                        }
+                    }
+                    Some(PopupKind::ConfirmRestart) => {
+                        if matches!(pending, Some(PendingPublish::RestartReview)) {
+                            // Clear draft and re-run all agents from scratch
+                            app.draft = None;
+                            app.agent_statuses.clear();
+                            start_agent_runner(app, config);
                         }
                     }
                     _ => {}
                 }
             }
             Action::Quit | Action::Back | Action::ExitInsert => {
-                app.pending_publish = None;
+                let kind = app.popup.as_ref().map(|p| p.kind.clone());
+                let pending = app.pending_publish.take();
                 app.dismiss_popup();
+                // On Esc from ConfirmRestart: navigate to DoubleCheck (resume)
+                if kind == Some(PopupKind::ConfirmRestart) {
+                    if matches!(pending, Some(PendingPublish::RestartReview)) {
+                        if app.draft.as_ref().map(|d| !d.comments.is_empty()).unwrap_or(false) {
+                            app.navigate_to(Screen::DoubleCheck);
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -475,9 +503,15 @@ async fn handle_action(
                     }
                 }
                 Screen::DoubleCheck => {
-                    let len = app.draft.as_ref().map(|d| d.comments.len()).unwrap_or(0);
-                    if app.double_check_selected + 1 < len {
-                        app.double_check_selected += 1;
+                    if app.double_check_pane == 1 {
+                        // detail panel: scroll down
+                        app.double_check_detail_scroll = app.double_check_detail_scroll.saturating_add(1);
+                    } else {
+                        let len = app.draft.as_ref().map(|d| d.comments.len()).unwrap_or(0);
+                        if app.double_check_selected + 1 < len {
+                            app.double_check_selected += 1;
+                            app.double_check_detail_scroll = 0;
+                        }
                     }
                 }
                 Screen::AgentConfig => {
@@ -502,6 +536,10 @@ async fn handle_action(
                         app.summary_comments_scroll = app.summary_comments_scroll.saturating_add(1);
                     }
                 }
+                Screen::ClaudeCodeOutput => {
+                    let max = app.claude_output.lines().count();
+                    app.claude_output_scroll = (app.claude_output_scroll + 3).min(max);
+                }
                 _ => {}
             }
         }
@@ -510,8 +548,13 @@ async fn handle_action(
             match app.screen {
                 Screen::PrList => app.nav_up(),
                 Screen::DoubleCheck => {
-                    if app.double_check_selected > 0 {
-                        app.double_check_selected -= 1;
+                    if app.double_check_pane == 1 {
+                        app.double_check_detail_scroll = app.double_check_detail_scroll.saturating_sub(1);
+                    } else {
+                        if app.double_check_selected > 0 {
+                            app.double_check_selected -= 1;
+                            app.double_check_detail_scroll = 0;
+                        }
                     }
                 }
                 Screen::FileTree => {
@@ -545,17 +588,65 @@ async fn handle_action(
                         app.summary_comments_scroll = app.summary_comments_scroll.saturating_sub(1);
                     }
                 }
+                Screen::ClaudeCodeOutput => {
+                    app.claude_output_scroll = app.claude_output_scroll.saturating_sub(3);
+                }
                 _ => {}
             }
         }
 
         Action::GoTop => {
-            app.pr_list_selected = 0;
-            app.diff_scroll = 0;
+            match app.screen {
+                Screen::DoubleCheck => {
+                    if app.double_check_pane == 1 {
+                        app.double_check_detail_scroll = 0;
+                    } else {
+                        app.double_check_selected = 0;
+                    }
+                }
+                Screen::PrDetail => { app.diff_scroll = 0; }
+                Screen::FileTree => { app.file_tree_scroll = 0; }
+                _ => { app.pr_list_selected = 0; }
+            }
         }
 
         Action::GoBottom => {
-            app.go_bottom();
+            match app.screen {
+                Screen::DoubleCheck => {
+                    if app.double_check_pane == 1 {
+                        // Scroll detail to end — render will clamp to max
+                        app.double_check_detail_scroll = usize::MAX / 2;
+                    } else {
+                        // Jump to last filtered comment
+                        let last = filtered_comment_count(app).saturating_sub(1);
+                        // Map filtered index back to real index
+                        if let Some(draft) = &app.draft {
+                            let comments = &draft.comments;
+                            let count = comments.len();
+                            if count > 0 {
+                                let visible: Vec<usize> = (0..count)
+                                    .filter(|&i| comment_passes_filter(app, i))
+                                    .collect();
+                                if let Some(&real_idx) = visible.get(last) {
+                                    app.double_check_selected = real_idx;
+                                }
+                            }
+                        }
+                    }
+                }
+                Screen::PrDetail => {
+                    let max = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
+                    app.diff_scroll = max.saturating_sub(app.diff_viewport_height);
+                }
+                Screen::FileTree => {
+                    app.file_tree_scroll = usize::MAX / 2; // clamped by render
+                }
+                Screen::ClaudeCodeOutput => {
+                    let max = app.claude_output.lines().count();
+                    app.claude_output_scroll = max;
+                }
+                _ => { app.go_bottom(); }
+            }
         }
 
         Action::ScrollDown => {
@@ -595,6 +686,8 @@ async fn handle_action(
         Action::NextPane => {
             if app.screen == Screen::SummaryPreview {
                 app.summary_pane = (app.summary_pane + 1) % 2;
+            } else if app.screen == Screen::DoubleCheck {
+                app.double_check_pane = (app.double_check_pane + 1) % 2;
             } else {
                 app.selected_pane = (app.selected_pane + 1) % 3;
             }
@@ -603,6 +696,8 @@ async fn handle_action(
         Action::PrevPane => {
             if app.screen == Screen::SummaryPreview {
                 app.summary_pane = if app.summary_pane == 0 { 1 } else { 0 };
+            } else if app.screen == Screen::DoubleCheck {
+                app.double_check_pane = if app.double_check_pane == 0 { 1 } else { 0 };
             } else {
                 app.selected_pane = if app.selected_pane == 0 { 2 } else { app.selected_pane - 1 };
             }
@@ -663,15 +758,45 @@ async fn handle_action(
         },
 
         Action::GenerateReview => {
-            if app.screen == Screen::PrDetail {
-                if !config.is_llm_configured() {
-                    app.show_info(
-                        "AI Unavailable",
-                        "Claude CLI not found and no API key configured.\nInstall Claude Code or set ANTHROPIC_API_KEY.",
-                    );
-                } else {
-                    start_agent_runner(app, config);
-                }
+            if !config.is_llm_configured() {
+                app.show_info(
+                    "AI Unavailable",
+                    "Claude CLI not found and no API key configured.\nInstall Claude Code or set ANTHROPIC_API_KEY.",
+                );
+            } else if app.screen == Screen::DoubleCheck {
+                // From DoubleCheck: run any agents not yet completed (append mode)
+                run_missing_agents(app, config);
+            } else if app.screen == Screen::PrDetail {
+                start_agent_runner(app, config);
+            }
+        }
+
+        Action::RunMissingAgents => {
+            if config.is_llm_configured() && app.screen == Screen::DoubleCheck {
+                run_missing_agents(app, config);
+            }
+        }
+
+        Action::ClaudeCodeFix => {
+            if app.screen == Screen::DoubleCheck {
+                send_to_claude_code(app, event_tx, config);
+            } else if app.screen == Screen::ClaudeCodeOutput {
+                // jk scrolling handled by NavUp/NavDown — nothing extra needed here
+            }
+        }
+
+        Action::RestartReview => {
+            if config.is_llm_configured() {
+                let n = app.draft.as_ref().map(|d| d.comments.len()).unwrap_or(0);
+                app.pending_publish = Some(crate::app::PendingPublish::RestartReview);
+                app.popup = Some(crate::app::PopupState {
+                    title: "Restart Review".to_string(),
+                    message: format!(
+                        "Clear all {} existing comment(s) and re-run all enabled agents?\n\nThis cannot be undone.",
+                        n
+                    ),
+                    kind: crate::app::PopupKind::ConfirmRestart,
+                });
             }
         }
 
@@ -946,7 +1071,7 @@ async fn handle_action(
                     1 => "REQUEST_CHANGES",
                     _ => "APPROVE",
                 };
-                let n = app.draft.as_ref().map(|d| d.approved_count()).unwrap_or(0);
+                let n = app.draft.as_ref().map(|d| d.submittable_count()).unwrap_or(0);
                 app.pending_publish = Some(crate::app::PendingPublish::FullReview);
                 app.popup = Some(crate::app::PopupState {
                     title: "Submit Review".to_string(),
@@ -1187,18 +1312,22 @@ fn start_agent_runner(app: &mut App, config: &config::AppConfig) {
     use agents::orchestrator::Orchestrator;
     use review::models::{ReviewDraft, ReviewMode};
 
-    // If a previous review exists with comments, resume it instead of re-running agents
+    // If a previous review exists with comments, ask user what to do
     if let Some(draft) = &app.draft {
         if !draft.comments.is_empty() {
             let n = draft.comments.len();
-            let date = draft.started_at
-                .format("%Y-%m-%d %H:%M UTC")
-                .to_string();
-            app.show_info(
-                "Resuming Review",
-                format!("Previous review started {date}\n{n} comment(s) found — resuming without re-running agents."),
-            );
-            app.navigate_to(Screen::DoubleCheck);
+            let date = draft.started_at.format("%Y-%m-%d %H:%M UTC").to_string();
+            app.pending_publish = Some(crate::app::PendingPublish::RestartReview);
+            app.popup = Some(crate::app::PopupState {
+                title: "Review In Progress".to_string(),
+                message: format!(
+                    "Review started {date} — {n} comment(s) already generated.\n\n\
+                     [Enter] Restart from scratch (clear all comments)\n\
+                     [Esc]   Resume existing (go to Double-Check)\n\n\
+                     To run only missing agents, press [Esc] then [r] in Double-Check."
+                ),
+                kind: crate::app::PopupKind::ConfirmRestart,
+            });
             return;
         }
     }
@@ -1232,6 +1361,70 @@ fn start_agent_runner(app: &mut App, config: &config::AppConfig) {
     // Launch the orchestrator; updates arrive via app.agent_rx
     let orchestrator = Orchestrator::new(config.clone());
     let rx = orchestrator.run_all(app.agents.clone(), ctx);
+    app.agent_rx = Some(rx);
+}
+
+/// Run only agents that haven't completed yet (no Done/Disabled status), appending results to
+/// the existing draft instead of replacing it.
+fn run_missing_agents(app: &mut App, config: &config::AppConfig) {
+    use agents::context::ReviewContext;
+    use agents::models::AgentStatus;
+    use agents::orchestrator::Orchestrator;
+    use review::models::{ReviewDraft, ReviewMode};
+
+    let pr = match &app.current_pr {
+        Some(pr) => pr.clone(),
+        None => {
+            app.show_error("No PR loaded — open a PR first.");
+            return;
+        }
+    };
+
+    // Determine which agents still need to run
+    let missing: Vec<_> = app.agents
+        .iter()
+        .filter(|a| {
+            if !a.agent.enabled { return false; }
+            match app.agent_statuses.get(&a.agent.id) {
+                Some(AgentStatus::Done { .. }) | Some(AgentStatus::Disabled) => false,
+                _ => true, // Pending, Running, Failed, or not started
+            }
+        })
+        .cloned()
+        .collect();
+
+    if missing.is_empty() {
+        app.show_info(
+            "All Agents Done",
+            "All enabled agents have already completed.\n\nUse [R] to restart from scratch.",
+        );
+        return;
+    }
+
+    let diff = app.current_diff.clone().unwrap_or_default();
+    let ticket = app.current_ticket.clone();
+    let ctx = ReviewContext::from_pr(&pr, &diff, ticket);
+
+    // Keep existing draft or create one; keep existing comments
+    let pr_num = pr.number;
+    if app.draft.is_none() {
+        app.draft = Some(ReviewDraft::new(pr_num, ReviewMode::AiOnly));
+    }
+
+    // Mark missing agents as Pending in status map
+    for agent in &missing {
+        app.agent_statuses.insert(
+            agent.agent.id.clone(),
+            agents::models::AgentStatus::Pending,
+        );
+    }
+
+    let n = missing.len();
+    app.navigate_to(Screen::AgentRunner);
+    app.set_status(format!("Running {} missing agent(s)…", n));
+
+    let orchestrator = Orchestrator::new(config.clone());
+    let rx = orchestrator.run_all(missing, ctx);
     app.agent_rx = Some(rx);
 }
 
@@ -1317,6 +1510,39 @@ fn save_compose_comment(app: &mut App) {
     app.compose_context.clear();
 }
 
+/// Returns how many comments pass the current agent filter.
+fn filtered_comment_count(app: &App) -> usize {
+    match &app.draft {
+        None => 0,
+        Some(d) => (0..d.comments.len())
+            .filter(|&i| comment_passes_filter(app, i))
+            .count(),
+    }
+}
+
+/// Returns true if the comment at `idx` passes the current agent filter.
+fn comment_passes_filter(app: &App, idx: usize) -> bool {
+    use review::models::CommentSource;
+    let filter = match app.agent_filter {
+        None => return true,
+        Some(f) => f,
+    };
+    let comment = match app.draft.as_ref().and_then(|d| d.comments.get(idx)) {
+        Some(c) => c,
+        None => return false,
+    };
+    match &comment.source {
+        CommentSource::Agent { agent_id, .. } => {
+            let idx_1based = app.agents.iter()
+                .position(|a| a.agent.id == *agent_id)
+                .map(|i| i as u8 + 1)
+                .unwrap_or(0);
+            idx_1based == filter
+        }
+        CommentSource::Manual => filter == 0,
+    }
+}
+
 fn toggle_comment(app: &mut App) {
     use review::models::CommentStatus;
     if let Some(draft) = &mut app.draft {
@@ -1376,6 +1602,110 @@ async fn publish_review(
             Err(e) => {
                 let _ = tx.send(AppEvent::PublishFailed(format!("{:#}", e)));
             }
+        }
+    });
+}
+
+// ── Claude Code integration ─────────────────────────────────────────────────
+
+/// Build the review task prompt from all non-rejected comments in the draft.
+fn build_claude_fix_prompt(app: &App) -> String {
+    use review::models::CommentStatus;
+    let pr = app.current_pr.as_ref();
+    let pr_num = pr.map(|p| p.number).unwrap_or(0);
+    let pr_title = pr.map(|p| p.title.as_str()).unwrap_or("Unknown PR");
+
+    let mut prompt = format!(
+        "You are a code-review assistant. Below are review comments that need to be applied \
+         to the codebase. For each comment, implement the suggested change as a concrete code \
+         edit. Show the exact file path, line numbers, and the corrected code.\n\n\
+         ## PR #{pr_num}: {pr_title}\n\n"
+    );
+
+    let draft = match &app.draft {
+        Some(d) => d,
+        None => {
+            prompt.push_str("No review comments found.");
+            return prompt;
+        }
+    };
+
+    let submittable: Vec<_> = draft.comments.iter()
+        .filter(|c| c.status != CommentStatus::Rejected)
+        .collect();
+
+    if submittable.is_empty() {
+        prompt.push_str("No comments to process (all were rejected).");
+        return prompt;
+    }
+
+    for (i, comment) in submittable.iter().enumerate() {
+        use review::models::CommentSource;
+        let source = match &comment.source {
+            CommentSource::Agent { agent_name, .. } => agent_name.clone(),
+            CommentSource::Manual => "Manual".to_string(),
+        };
+        let location = match (&comment.file_path, comment.line) {
+            (Some(f), Some(l)) => format!("{f}:{l}"),
+            (Some(f), None) => f.clone(),
+            _ => "(general)".to_string(),
+        };
+        prompt.push_str(&format!(
+            "### Comment {} — [{:?}] @ {}\nSource: {}\n\n{}\n\n---\n\n",
+            i + 1,
+            comment.severity,
+            location,
+            source,
+            comment.effective_body(),
+        ));
+    }
+
+    prompt.push_str(
+        "For each comment above, provide:\n\
+         1. The exact file and line(s) to change\n\
+         2. The corrected code\n\
+         3. A brief explanation of the fix\n"
+    );
+    prompt
+}
+
+/// Spawn a Claude Code subprocess with the review task and send results via event channel.
+fn send_to_claude_code(
+    app: &mut App,
+    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
+    config: &config::AppConfig,
+) {
+    let prompt = build_claude_fix_prompt(app);
+    let tx = tx.clone();
+    let llm = config.llm.clone();
+    let timeout = config.agents.timeout_secs.max(120); // at least 2 min for this task
+
+    app.claude_output = String::new();
+    app.claude_output_scroll = 0;
+    app.claude_output_loading = true;
+    app.navigate_to(Screen::ClaudeCodeOutput);
+
+    tokio::spawn(async move {
+        let system = "You are a senior software engineer performing code review corrections. \
+            Respond with concrete, actionable code changes. Be precise about file paths and line numbers.";
+
+        let client = reqwest::Client::new();
+        let result = agents::runner::call_provider(
+            &client,
+            &llm,
+            &llm.model.clone(),
+            llm.temperature,
+            llm.max_tokens,
+            system,
+            &prompt,
+            timeout,
+            "ai-fix",
+        )
+        .await;
+
+        match result {
+            Ok(text) => { let _ = tx.send(tui::event::AppEvent::ClaudeOutputDone(text)); }
+            Err(e)   => { let _ = tx.send(tui::event::AppEvent::ClaudeOutputFailed(format!("{:#}", e))); }
         }
     });
 }

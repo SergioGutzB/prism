@@ -64,13 +64,14 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
-    let n = app
-        .draft
-        .as_ref()
-        .map(|d| d.approved_count())
-        .unwrap_or(0);
+    let (n_submit, n_rejected) = app.draft.as_ref()
+        .map(|d| (d.submittable_count(), d.rejected_count()))
+        .unwrap_or((0, 0));
 
-    let header_title = format!(" Summary Preview — PR #{pr_num} — {n} approved comments ");
+    let header_title = format!(
+        " Summary Preview — PR #{pr_num} — {} to submit  {} rejected ",
+        n_submit, n_rejected
+    );
     let block = Block::default()
         .title(header_title.as_str())
         .title_style(Style::default().fg(t.title).add_modifier(Modifier::BOLD))
@@ -142,11 +143,8 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         }
     };
 
-    let approved: Vec<_> = draft
-        .comments
-        .iter()
-        .filter(|c| c.status == CommentStatus::Approved)
-        .collect();
+    // Show all non-rejected comments (Pending + Approved) — everything to be submitted
+    let approved: Vec<_> = draft.submittable_comments();
 
     let items: Vec<ListItem> = approved
         .iter()
@@ -169,7 +167,13 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 let b = c.effective_body();
                 if b.len() > 60 { format!("{}…", &b[..60]) } else { b.to_string() }
             };
+            let status_mark = match c.status {
+                CommentStatus::Approved => Span::styled("✓ ", Style::default().fg(t.agent_done)),
+                CommentStatus::Pending   => Span::styled("· ", Style::default().fg(t.muted)),
+                CommentStatus::Rejected  => Span::raw(""), // shouldn't appear
+            };
             let line1 = Line::from(vec![
+                status_mark,
                 Span::styled(format!("[{}] ", c.severity), Style::default().fg(sev_color)),
                 Span::styled(format!("{}{} ", source, file_info), Style::default().fg(t.muted)),
             ]);
@@ -182,7 +186,7 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .collect();
 
     let comments_title = format!(
-        " {} Approved Comments ({}) ",
+        " {}To Submit ({}) ",
         if focused { "[focused] " } else { "" },
         approved.len()
     );

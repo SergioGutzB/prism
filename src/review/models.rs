@@ -146,6 +146,30 @@ impl ReviewDraft {
             .collect()
     }
 
+    /// All comments that will be submitted: Approved + Pending (not explicitly rejected).
+    pub fn submittable_comments(&self) -> Vec<&GeneratedComment> {
+        self.comments
+            .iter()
+            .filter(|c| c.status != CommentStatus::Rejected)
+            .collect()
+    }
+
+    pub fn approved_count(&self) -> usize {
+        self.comments.iter().filter(|c| c.status == CommentStatus::Approved).count()
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.comments.iter().filter(|c| c.status == CommentStatus::Pending).count()
+    }
+
+    pub fn rejected_count(&self) -> usize {
+        self.comments.iter().filter(|c| c.status == CommentStatus::Rejected).count()
+    }
+
+    pub fn submittable_count(&self) -> usize {
+        self.comments.iter().filter(|c| c.status != CommentStatus::Rejected).count()
+    }
+
     pub fn suggested_event(&self) -> ReviewEvent {
         let approved = self.approved_comments();
         let max_severity = approved.iter().map(|c| &c.severity).max();
@@ -245,14 +269,4 @@ impl ReviewDraft {
             .replace("{comments_list}", &comments_list)
     }
 
-    pub fn pending_count(&self) -> usize {
-        self.comments
-            .iter()
-            .filter(|c| c.status == CommentStatus::Pending)
-            .count()
-    }
-
-    pub fn approved_count(&self) -> usize {
-        self.approved_comments().len()
-    }
 }

@@ -2,6 +2,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState};
 
 use crate::app::App;
+use crate::tui::keybindings::InputMode;
 use crate::ui::components::keybind_bar;
 use crate::ui::theme::Theme;
 
@@ -83,18 +84,21 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         inner,
     );
 
-    // Show search filter if active
-    if !app.pr_list_filter.is_empty() {
+    // Show search filter when searching (Insert mode) or when filter has text
+    let is_searching = app.input_mode == InputMode::Insert;
+    if is_searching || !app.pr_list_filter.is_empty() {
+        let cursor = if is_searching { "█" } else { "" };
+        let filter_text = format!("/ {}{}", app.pr_list_filter, cursor);
         let filter_area = Rect {
             x: inner.x,
             y: inner.y,
-            width: inner.width.min(40),
+            width: inner.width.min(50),
             height: 1,
         };
         frame.render_widget(Clear, filter_area);
         frame.render_widget(
-            Paragraph::new(format!("/ {}", app.pr_list_filter))
-                .style(Style::default().fg(t.highlight)),
+            Paragraph::new(filter_text)
+                .style(Style::default().fg(t.highlight).add_modifier(Modifier::BOLD)),
             filter_area,
         );
     }

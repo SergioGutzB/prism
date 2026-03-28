@@ -23,6 +23,7 @@ pub enum Screen {
     SummaryPreview,
     AgentConfig,
     Settings,
+    ClaudeCodeOutput,
 }
 
 impl Default for Screen {
@@ -54,12 +55,16 @@ pub enum PopupKind {
     /// Requires Enter to confirm quit, Esc to cancel.
     ConfirmQuit,
     ConfirmPublish,
+    /// Confirm restarting the review (clears existing comments).
+    ConfirmRestart,
 }
 
 #[derive(Debug, Clone)]
 pub enum PendingPublish {
     QuickComment { text: String },
     FullReview,
+    RestartReview,
+    RunMissingAgents,
 }
 
 /// Global application state — all mutable state lives here.
@@ -110,8 +115,10 @@ pub struct App {
     pub compose_text: String,
     pub compose_cursor: usize,
 
-    // DoubleCheck selection
+    // DoubleCheck selection and detail panel
     pub double_check_selected: usize,
+    pub double_check_pane: u8,          // 0 = list, 1 = detail
+    pub double_check_detail_scroll: usize,
 
     // SummaryPreview state
     pub summary_event_idx: usize,
@@ -159,6 +166,11 @@ pub struct App {
     pub token_output_total: u64,
     pub token_calls_total: u64,
 
+    // Claude Code output screen state
+    pub claude_output: String,
+    pub claude_output_scroll: usize,
+    pub claude_output_loading: bool,
+
     // Setup wizard state
     pub setup_gh_token: String,       // token detected from gh CLI
     pub setup_owner: String,          // editable owner field
@@ -202,6 +214,8 @@ impl App {
             compose_quick_mode: false,
             pending_publish: None,
             double_check_selected: 0,
+            double_check_pane: 0,
+            double_check_detail_scroll: 0,
             summary_event_idx: 0, // default: COMMENT
             summary_pane: 0,
             summary_body_scroll: 0,
@@ -222,6 +236,9 @@ impl App {
             token_input_total: 0,
             token_output_total: 0,
             token_calls_total: 0,
+            claude_output: String::new(),
+            claude_output_scroll: 0,
+            claude_output_loading: false,
             setup_gh_token: String::new(),
             setup_owner: String::new(),
             setup_repo: String::new(),
@@ -244,6 +261,10 @@ impl App {
             self.file_tree_scroll = 0;
             self.file_tree_pane = 0;
             self.file_tree_line = 0;
+        }
+        if matches!(self.screen, Screen::DoubleCheck) {
+            self.double_check_pane = 0;
+            self.double_check_detail_scroll = 0;
         }
         if !matches!(self.screen, Screen::PrDetail) {
             self.diff_fullscreen = false;

@@ -87,10 +87,60 @@ pub struct TicketProviderConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LlmConfig {
+    /// LLM backend. Supported values:
+    /// "claude-cli"  — Claude Code CLI (`claude --print`), no API key needed
+    /// "anthropic"   — Direct Anthropic Messages API (ANTHROPIC_API_KEY)
+    /// "openai"      — OpenAI Chat Completions API (OPENAI_API_KEY)
+    /// "gemini"      — Google Gemini API (GEMINI_API_KEY or GOOGLE_API_KEY)
+    /// "ollama"      — Local Ollama server (no key, set base_url if non-default)
     pub provider: String,
     pub model: String,
     pub max_tokens: u32,
     pub temperature: f32,
+    /// API key. If empty, falls back to the provider's standard env var.
+    #[serde(default)]
+    pub api_key: String,
+    /// Override the API base URL (e.g. Azure OpenAI endpoint, custom Ollama host).
+    /// Leave empty to use the provider's default endpoint.
+    #[serde(default)]
+    pub base_url: String,
+}
+
+impl LlmConfig {
+    /// Resolve the API key: config field takes priority, then env var.
+    pub fn effective_api_key(&self) -> String {
+        if !self.api_key.is_empty() {
+            return self.api_key.clone();
+        }
+        match self.provider.as_str() {
+            "anthropic" | "claude" | "claude-cli" => {
+                std::env::var("ANTHROPIC_API_KEY").unwrap_or_default()
+            }
+            "openai" | "codex" => {
+                std::env::var("OPENAI_API_KEY").unwrap_or_default()
+            }
+            "gemini" => {
+                std::env::var("GEMINI_API_KEY")
+                    .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+                    .unwrap_or_default()
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Resolve the base URL: config field takes priority, then provider default.
+    pub fn effective_base_url(&self) -> &str {
+        if !self.base_url.is_empty() {
+            return &self.base_url;
+        }
+        match self.provider.as_str() {
+            "anthropic" => "https://api.anthropic.com",
+            "openai" | "codex" => "https://api.openai.com",
+            "gemini" => "https://generativelanguage.googleapis.com",
+            "ollama" => "http://localhost:11434",
+            _ => "",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -101,6 +151,42 @@ pub struct AgentsConfig {
     #[serde(default)]
     pub diff_exclude_patterns: Vec<String>,
     pub max_diff_tokens: u32,
+    /// Review strictness level. Controls how much the AI focuses on issues.
+    /// Values: "critical_only" | "strict" | "moderate" | "light"
+    #[serde(default = "default_review_rigor")]
+    pub review_rigor: String,
+}
+
+fn default_review_rigor() -> String {
+    "moderate".to_string()
+}
+
+impl AgentsConfig {
+    /// Returns a system-prompt prefix that adjusts agent behavior based on rigor level.
+    pub fn rigor_prefix(&self) -> &'static str {
+        match self.review_rigor.as_str() {
+            "critical_only" => {
+                "IMPORTANT CONSTRAINT: Only report CRITICAL issues — security vulnerabilities, \
+                 data-loss bugs, crashes, or breaking API changes. If nothing critical is found, \
+                 return an empty array []. Do NOT report style issues, minor suggestions, or \
+                 anything that does not have a direct functional impact.\n\n"
+            }
+            "strict" => {
+                "REVIEW MODE: Strict. Be thorough and rigorous. Flag all potential issues \
+                 including style inconsistencies, performance concerns, maintainability problems, \
+                 and correctness issues. Include minor suggestions where relevant.\n\n"
+            }
+            "light" => {
+                "REVIEW MODE: Light. Focus only on significant bugs and clear improvements. \
+                 Avoid nitpicking style, naming, or trivial formatting. Only report issues \
+                 that clearly matter for correctness or maintainability.\n\n"
+            }
+            _ => {
+                // "moderate" — no extra prefix, default agent behavior
+                ""
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -211,9 +297,11 @@ impl AppConfig {
     }
 
     pub fn is_llm_configured(&self) -> bool {
-        std::env::var("ANTHROPIC_API_KEY").is_ok()
-            || std::env::var("OPENAI_API_KEY").is_ok()
-            || Self::is_claude_cli_available()
+        match self.llm.provider.as_str() {
+            "claude-cli" | "claude" => Self::is_claude_cli_available(),
+            "ollama" => true, // local, no key required
+            _ => !self.llm.effective_api_key().is_empty(),
+        }
     }
 
     /// Check if the `claude` CLI is available in PATH.

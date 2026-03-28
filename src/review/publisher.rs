@@ -14,12 +14,12 @@ impl ReviewPublisher {
         Self { api }
     }
 
-    /// Publish all approved comments in the draft as a single PR review.
+    /// Publish all non-rejected comments (Approved + Pending) as a single PR review.
     pub async fn publish(&self, draft: &ReviewDraft) -> Result<()> {
-        let approved: Vec<&GeneratedComment> = draft.approved_comments();
+        let approved: Vec<&GeneratedComment> = draft.submittable_comments();
 
         if approved.is_empty() {
-            warn!("No approved comments to publish — submitting empty review");
+            warn!("No submittable comments — submitting empty review body only");
         }
 
         let inline_comments: Vec<crate::github::models::ReviewComment> = approved

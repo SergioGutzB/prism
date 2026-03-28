@@ -27,50 +27,43 @@ struct RawSummary {
 
 pub struct AgentRunner {
     config: AppConfig,
+    /// Shared HTTP client for API-based providers.
+    client: reqwest::Client,
 }
 
 impl AgentRunner {
     pub fn new(config: AppConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            client: reqwest::Client::new(),
+        }
     }
 
     /// Execute a single agent against the given review context.
-    /// Returns an `AgentStatus` — never panics.
-    pub async fn run(
-        &self,
-        agent: &AgentDefinition,
-        ctx: &ReviewContext,
-    ) -> AgentStatus {
+    pub async fn run(&self, agent: &AgentDefinition, ctx: &ReviewContext) -> AgentStatus {
         if !agent.agent.enabled {
             return AgentStatus::Disabled;
         }
 
-        let _started_at = chrono::Utc::now();
         let start = Instant::now();
-
         match self.run_inner(agent, ctx).await {
             Ok((comments, input_tokens, output_tokens)) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 AgentStatus::Done { comments, elapsed_ms, input_tokens, output_tokens }
             }
-            Err(e) => AgentStatus::Failed {
-                error: format!("{:#}", e),
-            },
+            Err(e) => AgentStatus::Failed { error: format!("{:#}", e) },
         }
     }
 
-    /// Returns (comments, input_token_estimate, output_token_estimate)
     async fn run_inner(
         &self,
         agent: &AgentDefinition,
         ctx: &ReviewContext,
     ) -> Result<(Vec<GeneratedComment>, u64, u64)> {
-        // Build the prompt
         let prompt = self.build_prompt(agent, ctx);
         let system_len = agent.agent.prompt.system.len();
-        debug!(agent_id = %agent.agent.id, prompt_len = prompt.len(), "Running agent");
+        debug!(agent_id = %agent.agent.id, prompt_len = prompt.len(), provider = %self.config.llm.provider, "Running agent");
 
-        // Attempt LLM call with 1 retry on JSON parse failure
         let raw_response = self.call_llm(agent, &prompt).await?;
 
         let input_tokens = ((system_len + prompt.len()) / 4) as u64;
@@ -79,18 +72,13 @@ impl AgentRunner {
         match self.parse_response(agent, &raw_response) {
             Ok(comments) => Ok((comments, input_tokens, output_tokens)),
             Err(parse_err) => {
-                warn!(
-                    agent_id = %agent.agent.id,
-                    "First parse attempt failed ({}), retrying",
-                    parse_err
-                );
+                warn!(agent_id = %agent.agent.id, "First parse attempt failed ({}), retrying", parse_err);
                 let retry_prompt = format!(
                     "{}\n\nYour previous response could not be parsed as JSON. \
                      Please respond ONLY with valid JSON, no markdown fences.",
                     prompt
                 );
                 let retry_response = self.call_llm(agent, &retry_prompt).await?;
-                // Add retry token costs too
                 let retry_in = (retry_prompt.len() / 4) as u64;
                 let retry_out = (retry_response.len() / 4) as u64;
                 let comments = self.parse_response(agent, &retry_response)
@@ -109,7 +97,6 @@ impl AgentRunner {
                 ctx.pr_title, ctx.pr_number, ctx.pr_author, ctx.pr_description
             ));
         }
-
         if agent.agent.context.include_ticket {
             if let Some(ticket) = &ctx.ticket {
                 parts.push(format!(
@@ -118,98 +105,59 @@ impl AgentRunner {
                 ));
             }
         }
-
         if agent.agent.context.include_file_list {
             parts.push(format!("## Changed Files\n\n{}", ctx.file_list_text()));
         }
-
         if agent.agent.context.include_diff {
             let diff = ctx.truncated_diff(self.config.agents.max_diff_tokens);
             parts.push(format!("## Diff\n\n```diff\n{}\n```", diff));
         }
-
         parts.push(agent.agent.prompt.prompt_suffix.clone());
         parts.join("\n\n")
     }
 
-    async fn call_llm(
-        &self,
-        agent: &AgentDefinition,
-        prompt: &str,
-    ) -> Result<String> {
-        use std::process::Stdio;
-        use tokio::io::AsyncWriteExt;
-        use tokio::process::Command;
+    /// Dispatch to the right LLM backend based on `config.llm.provider`.
+    async fn call_llm(&self, agent: &AgentDefinition, prompt: &str) -> Result<String> {
+        let rigor_prefix = self.config.agents.rigor_prefix();
+        let system = if rigor_prefix.is_empty() {
+            agent.agent.prompt.system.clone()
+        } else {
+            format!("{}{}", rigor_prefix, agent.agent.prompt.system)
+        };
 
-        let timeout_secs = self.config.agents.timeout_secs;
-        let system_prompt = &agent.agent.prompt.system;
+        // Per-agent model/temperature override (if defined in agent YAML)
+        let model = agent.agent.llm.as_ref()
+            .and_then(|o| o.model.as_deref())
+            .unwrap_or(&self.config.llm.model);
+        let temperature = agent.agent.llm.as_ref()
+            .and_then(|o| o.temperature)
+            .unwrap_or(self.config.llm.temperature);
+        let max_tokens = agent.agent.llm.as_ref()
+            .and_then(|o| o.max_tokens)
+            .unwrap_or(self.config.llm.max_tokens);
 
-        let mut child = Command::new("claude")
-            .arg("--print")
-            .arg("--system-prompt")
-            .arg(system_prompt)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Failed to spawn `claude` — is Claude Code installed?")?;
+        let timeout = self.config.agents.timeout_secs;
 
-        // Write user prompt to stdin, then close it to signal EOF
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(prompt.as_bytes())
-                .await
-                .context("Failed to write prompt to claude stdin")?;
-        }
-
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
+        call_provider(
+            &self.client,
+            &self.config.llm,
+            model,
+            temperature,
+            max_tokens,
+            &system,
+            prompt,
+            timeout,
+            &agent.agent.id,
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Agent '{}' timed out after {}s",
-                agent.agent.id,
-                timeout_secs
-            )
-        })?
-        .context("Failed to collect claude output")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "claude exited with code {}: {}",
-                output.status,
-                stderr.trim()
-            );
-        }
-
-        let text = String::from_utf8(output.stdout)
-            .context("claude output is not valid UTF-8")?;
-
-        if text.trim().is_empty() {
-            anyhow::bail!(
-                "claude returned an empty response for agent '{}'",
-                agent.agent.id
-            );
-        }
-
-        Ok(text)
     }
 
-    fn parse_response(
-        &self,
-        agent: &AgentDefinition,
-        response: &str,
-    ) -> Result<Vec<GeneratedComment>> {
-        // Strip markdown code fences if present
+    fn parse_response(&self, agent: &AgentDefinition, response: &str) -> Result<Vec<GeneratedComment>> {
         let json_str = strip_markdown_fences(response);
 
         if agent.agent.id == "summary" {
             let raw: RawSummary = serde_json::from_str(json_str)
                 .context("Failed to parse summary JSON")?;
-            let severity = parse_severity(raw.severity.as_deref());
             let comment = GeneratedComment::new(
                 CommentSource::Agent {
                     agent_id: agent.agent.id.clone(),
@@ -217,7 +165,7 @@ impl AgentRunner {
                     agent_icon: agent.agent.icon.clone(),
                 },
                 raw.body,
-                severity,
+                parse_severity(raw.severity.as_deref()),
                 None,
                 None,
             );
@@ -225,10 +173,9 @@ impl AgentRunner {
         } else {
             let raw_comments: Vec<RawComment> = serde_json::from_str(json_str)
                 .context("Failed to parse comments JSON array")?;
-            let comments = raw_comments
+            Ok(raw_comments
                 .into_iter()
                 .map(|rc| {
-                    let severity = parse_severity(rc.severity.as_deref());
                     GeneratedComment::new(
                         CommentSource::Agent {
                             agent_id: agent.agent.id.clone(),
@@ -236,15 +183,337 @@ impl AgentRunner {
                             agent_icon: agent.agent.icon.clone(),
                         },
                         rc.body,
-                        severity,
+                        parse_severity(rc.severity.as_deref()),
                         rc.file_path,
                         rc.line,
                     )
                 })
-                .collect();
-            Ok(comments)
+                .collect())
         }
     }
+}
+
+// ── Multi-provider dispatch ────────────────────────────────────────────────────
+
+/// Call the configured LLM provider and return the raw text response.
+/// This is a free function so it can be reused from main.rs (e.g. ClaudeCodeFix).
+#[allow(clippy::too_many_arguments)]
+pub async fn call_provider(
+    client: &reqwest::Client,
+    llm: &crate::config::LlmConfig,
+    model: &str,
+    temperature: f32,
+    max_tokens: u32,
+    system: &str,
+    prompt: &str,
+    timeout_secs: u64,
+    context_label: &str,
+) -> Result<String> {
+    match llm.provider.as_str() {
+        "claude-cli" | "claude" => {
+            call_claude_cli(system, prompt, timeout_secs, context_label).await
+        }
+        "anthropic" => {
+            call_anthropic(client, llm, model, temperature, max_tokens, system, prompt, timeout_secs).await
+        }
+        "openai" | "codex" => {
+            call_openai(client, llm, model, temperature, max_tokens, system, prompt, timeout_secs).await
+        }
+        "gemini" => {
+            call_gemini(client, llm, model, temperature, max_tokens, system, prompt, timeout_secs).await
+        }
+        "ollama" => {
+            call_ollama(client, llm, model, temperature, max_tokens, system, prompt, timeout_secs).await
+        }
+        other => anyhow::bail!(
+            "Unknown LLM provider: '{}'. Supported: claude-cli, anthropic, openai, gemini, ollama",
+            other
+        ),
+    }
+}
+
+// ── claude-cli ────────────────────────────────────────────────────────────────
+
+async fn call_claude_cli(
+    system: &str,
+    prompt: &str,
+    timeout_secs: u64,
+    context_label: &str,
+) -> Result<String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    let mut child = Command::new("claude")
+        .arg("--print")
+        .arg("--system-prompt")
+        .arg(system)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn `claude` — is Claude Code installed and in PATH?")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(prompt.as_bytes()).await
+            .context("Failed to write prompt to claude stdin")?;
+    }
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("'{}' timed out after {}s (claude-cli)", context_label, timeout_secs))?
+    .context("Failed to collect claude output")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("claude exited with {}: {}", output.status, stderr.trim());
+    }
+    let text = String::from_utf8(output.stdout).context("claude output is not valid UTF-8")?;
+    if text.trim().is_empty() {
+        anyhow::bail!("claude returned an empty response for '{}'", context_label);
+    }
+    Ok(text)
+}
+
+// ── Anthropic Messages API ────────────────────────────────────────────────────
+
+async fn call_anthropic(
+    client: &reqwest::Client,
+    llm: &crate::config::LlmConfig,
+    model: &str,
+    temperature: f32,
+    max_tokens: u32,
+    system: &str,
+    prompt: &str,
+    timeout_secs: u64,
+) -> Result<String> {
+    let api_key = llm.effective_api_key();
+    if api_key.is_empty() {
+        anyhow::bail!("Anthropic API key not set — set ANTHROPIC_API_KEY or llm.api_key in config");
+    }
+    let base = llm.effective_base_url();
+    let url = format!("{}/v1/messages", base);
+
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "system": system,
+        "messages": [{"role": "user", "content": prompt}]
+    });
+
+    debug!("POST Anthropic /v1/messages model={}", model);
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        client
+            .post(&url)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Anthropic API timed out after {}s", timeout_secs))?
+    .context("Failed to reach Anthropic API")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Anthropic API error {}: {}", status, text);
+    }
+
+    let json: serde_json::Value = resp.json().await.context("Failed to parse Anthropic response")?;
+    extract_text(&json, &["content", "0", "text"])
+        .ok_or_else(|| anyhow::anyhow!("Unexpected Anthropic response shape: {}", json))
+}
+
+// ── OpenAI Chat Completions API ───────────────────────────────────────────────
+
+async fn call_openai(
+    client: &reqwest::Client,
+    llm: &crate::config::LlmConfig,
+    model: &str,
+    temperature: f32,
+    max_tokens: u32,
+    system: &str,
+    prompt: &str,
+    timeout_secs: u64,
+) -> Result<String> {
+    let api_key = llm.effective_api_key();
+    if api_key.is_empty() {
+        anyhow::bail!("OpenAI API key not set — set OPENAI_API_KEY or llm.api_key in config");
+    }
+    let base = llm.effective_base_url();
+    let url = format!("{}/v1/chat/completions", base);
+
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": prompt}
+        ]
+    });
+
+    debug!("POST OpenAI /v1/chat/completions model={}", model);
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        client
+            .post(&url)
+            .bearer_auth(&api_key)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("OpenAI API timed out after {}s", timeout_secs))?
+    .context("Failed to reach OpenAI API")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("OpenAI API error {}: {}", status, text);
+    }
+
+    let json: serde_json::Value = resp.json().await.context("Failed to parse OpenAI response")?;
+    extract_text(&json, &["choices", "0", "message", "content"])
+        .ok_or_else(|| anyhow::anyhow!("Unexpected OpenAI response shape: {}", json))
+}
+
+// ── Google Gemini API ─────────────────────────────────────────────────────────
+
+async fn call_gemini(
+    client: &reqwest::Client,
+    llm: &crate::config::LlmConfig,
+    model: &str,
+    temperature: f32,
+    max_tokens: u32,
+    system: &str,
+    prompt: &str,
+    timeout_secs: u64,
+) -> Result<String> {
+    let api_key = llm.effective_api_key();
+    if api_key.is_empty() {
+        anyhow::bail!("Gemini API key not set — set GEMINI_API_KEY (or GOOGLE_API_KEY) or llm.api_key in config");
+    }
+    let base = llm.effective_base_url();
+    let url = format!(
+        "{}/v1beta/models/{}:generateContent?key={}",
+        base, model, api_key
+    );
+
+    let body = serde_json::json!({
+        "system_instruction": {
+            "parts": [{"text": system}]
+        },
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": temperature
+        }
+    });
+
+    debug!("POST Gemini generateContent model={}", model);
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        client
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Gemini API timed out after {}s", timeout_secs))?
+    .context("Failed to reach Gemini API")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Gemini API error {}: {}", status, text);
+    }
+
+    let json: serde_json::Value = resp.json().await.context("Failed to parse Gemini response")?;
+    extract_text(&json, &["candidates", "0", "content", "parts", "0", "text"])
+        .ok_or_else(|| anyhow::anyhow!("Unexpected Gemini response shape: {}", json))
+}
+
+// ── Ollama (local) ────────────────────────────────────────────────────────────
+
+async fn call_ollama(
+    client: &reqwest::Client,
+    llm: &crate::config::LlmConfig,
+    model: &str,
+    temperature: f32,
+    max_tokens: u32,
+    system: &str,
+    prompt: &str,
+    timeout_secs: u64,
+) -> Result<String> {
+    let base = llm.effective_base_url();
+    let url = format!("{}/api/chat", base);
+
+    let body = serde_json::json!({
+        "model": model,
+        "stream": false,
+        "messages": [
+            {"role": "system",  "content": system},
+            {"role": "user",    "content": prompt}
+        ],
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_tokens
+        }
+    });
+
+    debug!("POST Ollama /api/chat model={}", model);
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        client
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Ollama timed out after {}s — is it running?", timeout_secs))?
+    .context("Failed to reach Ollama (is it running on localhost:11434?)")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Ollama error {}: {}", status, text);
+    }
+
+    let json: serde_json::Value = resp.json().await.context("Failed to parse Ollama response")?;
+    extract_text(&json, &["message", "content"])
+        .ok_or_else(|| anyhow::anyhow!("Unexpected Ollama response shape: {}", json))
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Navigate a JSON value using a path of string keys/array indices.
+fn extract_text(v: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut cur = v;
+    for key in path {
+        cur = match cur {
+            serde_json::Value::Object(m) => m.get(*key)?,
+            serde_json::Value::Array(a) => {
+                let idx: usize = key.parse().ok()?;
+                a.get(idx)?
+            }
+            _ => return None,
+        };
+    }
+    cur.as_str().map(|s| s.to_string())
 }
 
 fn strip_markdown_fences(s: &str) -> &str {
@@ -256,11 +525,7 @@ fn strip_markdown_fences(s: &str) -> &str {
     } else {
         s
     };
-    let s = if s.ends_with("```") {
-        s.trim_end_matches("```")
-    } else {
-        s
-    };
+    let s = if s.ends_with("```") { s.trim_end_matches("```") } else { s };
     s.trim()
 }
 

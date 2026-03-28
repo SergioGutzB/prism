@@ -29,6 +29,8 @@ pub enum AppEvent {
     ReviewsLoaded(Vec<crate::github::models::GhReview>, Vec<crate::github::models::GhPrComment>),
     QuickCommentDone,
     QuickCommentFailed(String),
+    ClaudeOutputDone(String),
+    ClaudeOutputFailed(String),
 }
 
 /// Spawn a background thread that polls crossterm key events.

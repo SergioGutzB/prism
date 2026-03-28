@@ -6,8 +6,8 @@ use ratatui::Frame;
 
 use crate::app::App;
 use crate::ui::screens::{
-    agent_config, agent_runner, double_check, file_tree, pr_detail, pr_list, review_compose,
-    setup, summary_preview,
+    agent_config, agent_runner, claude_output, double_check, file_tree, pr_detail, pr_list,
+    review_compose, setup, summary_preview,
 };
 
 /// Top-level render dispatch — pure function, never modifies App.
@@ -23,6 +23,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         crate::app::Screen::SummaryPreview => summary_preview::render(frame, app),
         crate::app::Screen::AgentConfig => agent_config::render(frame, app),
         crate::app::Screen::Settings => render_settings(frame, app),
+        crate::app::Screen::ClaudeCodeOutput => claude_output::render(frame, app),
     }
 
     // Overlay popup on top of everything
@@ -137,6 +138,10 @@ fn render_settings(frame: &mut Frame, app: &App) {
         ListItem::new(Line::from(vec![
             Span::styled("   Timeout      ", Style::default().fg(t.muted)),
             Span::styled(format!("{}s", cfg.agents.timeout_secs), Style::default().fg(t.foreground).add_modifier(Modifier::BOLD)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("   Review rigor ", Style::default().fg(t.muted)),
+            Span::styled(cfg.agents.review_rigor.clone(), Style::default().fg(t.warning).add_modifier(Modifier::BOLD)),
         ])),
         // Section: UI
         ListItem::new(Line::from(Span::styled(" \u{2500}\u{2500} UI \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}", Style::default().fg(t.title)))),
