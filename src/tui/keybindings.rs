@@ -149,6 +149,7 @@ pub enum Action {
     Char(char),
     FilterAgent(u8),
     ClaudeCodeFix,
+    ReloadConfig,
 }
 
 /// Map a raw `KeyEvent` to an `Action` given the current input mode.
@@ -226,6 +227,7 @@ pub fn map_key(key: &KeyEvent, mode: &InputMode) -> Option<Action> {
                 KeyCode::Char('R') => Some(Action::RestartReview),
                 KeyCode::Char('C') => Some(Action::ClaudeCodeFix),
                 KeyCode::Char('X') => Some(Action::ClearCache),
+                KeyCode::Char('L') => Some(Action::ReloadConfig),
                 // Filter by agent number (1-7)
                 KeyCode::Char(c @ '1'..='7') => {
                     Some(Action::FilterAgent(c as u8 - b'0'))

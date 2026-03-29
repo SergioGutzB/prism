@@ -25,23 +25,25 @@ key_patterns = ["[a-z]+-[0-9]+"]
 #   "openai"      OpenAI Chat Completions → set OPENAI_API_KEY
 #   "gemini"      Google Gemini API       → set GEMINI_API_KEY or GOOGLE_API_KEY
 #   "ollama"      Local Ollama server     → no key needed (default: localhost:11434)
-provider = "claude-cli"
+# provider = "claude-cli"
+provider = "gemini"
 
 # Model name for the selected provider, e.g.:
 #   anthropic : "claude-opus-4-6" | "claude-sonnet-4-6" | "claude-haiku-4-5"
 #   openai    : "gpt-4o" | "gpt-4-turbo" | "o3"
-#   gemini    : "gemini-1.5-pro" | "gemini-1.5-flash" | "gemini-2.0-flash"
-#   ollama    : "llama3.2" | "codellama" | "deepseek-coder"
-model = "claude-opus-4-6"
-max_tokens = 4096
+#   gemini    : "gemini-1.5-pro" | "gemini-1.5-flash" | "gemini-2.0-flash" | "gemini-flash-latest"
+# ollama    : "llama3.2" | "codellama" | "deepseek-coder"
+# model = "claude-opus-4-6"
+model    = "gemini-flash-latest"
+max_tokens = 8192
 temperature = 0.2
 # api_key = ""     # overrides env var; leave empty to use ANTHROPIC_API_KEY etc.
 # base_url = ""    # custom endpoint (Azure OpenAI, custom Ollama host, etc.)
 
 [agents]
 agents_dir = "~/.config/prism/agents"
-concurrency = 3
-timeout_secs = 360
+concurrency = 1
+timeout_secs = 300
 
 # Files matching these glob patterns are excluded from every agent's diff.
 # Patterns are matched against the full path and every sub-path (so "dist/*"

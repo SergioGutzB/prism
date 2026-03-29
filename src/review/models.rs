@@ -50,12 +50,32 @@ pub enum CommentSource {
     Manual,
 }
 
+impl CommentSource {
+    pub fn score(&self) -> u8 {
+        match self {
+            CommentSource::Manual => 2,
+            CommentSource::Agent { .. } => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Severity {
     Praise,
     Suggestion,
     Warning,
     Critical,
+}
+
+impl Severity {
+    pub fn score(&self) -> u8 {
+        match self {
+            Severity::Praise => 1,
+            Severity::Suggestion => 2,
+            Severity::Warning => 3,
+            Severity::Critical => 4,
+        }
+    }
 }
 
 impl std::fmt::Display for Severity {
@@ -180,8 +200,52 @@ impl ReviewDraft {
         }
     }
 
-    pub fn add_comment(&mut self, comment: GeneratedComment) {
-        self.comments.push(comment);
+    pub fn add_comment(&mut self, new_comment: GeneratedComment) {
+        // If it's a general comment (no file/line), just add it.
+        if new_comment.file_path.is_none() || new_comment.line.is_none() {
+            self.comments.push(new_comment);
+            return;
+        }
+
+        let mut should_add = true;
+        let mut to_replace = None;
+
+        for (idx, existing) in self.comments.iter().enumerate() {
+            // Only compare if they are on the same file and line
+            if existing.file_path == new_comment.file_path && existing.line == new_comment.line {
+                // Calculate word-level similarity (Jaccard-like overlap)
+                let existing_words: std::collections::HashSet<_> = existing.effective_body().split_whitespace().map(|s| s.to_lowercase()).collect();
+                let new_words: std::collections::HashSet<_> = new_comment.effective_body().split_whitespace().map(|s| s.to_lowercase()).collect();
+                
+                if !existing_words.is_empty() && !new_words.is_empty() {
+                    let intersection = existing_words.intersection(&new_words).count();
+                    let union = existing_words.union(&new_words).count();
+                    let similarity = (intersection as f32) / (union as f32);
+
+                    // If they are more than 50% similar, they are likely duplicates/redundant
+                    if similarity > 0.5 {
+                        // Prioritize: 1. Manual over Agent, 2. Higher Severity, 3. Longer body
+                        let existing_priority = (existing.source.score(), existing.severity.score(), existing.body.len());
+                        let new_priority = (new_comment.source.score(), new_comment.severity.score(), new_comment.body.len());
+
+                        if new_priority > existing_priority {
+                            // The new one is "better", we will replace the existing one
+                            to_replace = Some(idx);
+                        } else {
+                            // The existing one is better or equal, skip adding the new one
+                            should_add = false;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(idx) = to_replace {
+            self.comments[idx] = new_comment;
+        } else if should_add {
+            self.comments.push(new_comment);
+        }
     }
 
     pub fn approve_all(&mut self) {

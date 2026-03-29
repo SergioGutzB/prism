@@ -537,40 +537,62 @@ async fn call_gemini(
         base, model, api_key
     );
 
+    // Merge system instructions into the prompt for maximum compatibility.
+    // This avoids all versioning issues with the 'systemInstruction' field.
+    let combined_prompt = if system.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("SYSTEM INSTRUCTIONS:\n{}\n\nUSER PROMPT:\n{}", system, prompt)
+    };
+
     let body = serde_json::json!({
-        "system_instruction": {
-            "parts": [{"text": system}]
-        },
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": combined_prompt}]
+        }],
         "generationConfig": {
             "maxOutputTokens": max_tokens,
             "temperature": temperature
         }
     });
 
-    debug!("POST Gemini generateContent model={}", model);
+    let mut attempts = 0;
+    let max_attempts = 3;
 
-    let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        client
-            .post(&url)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Gemini API timed out after {}s", timeout_secs))?
-    .context("Failed to reach Gemini API")?;
+    loop {
+        attempts += 1;
+        debug!("POST Gemini generateContent model={} attempt={}", model, attempts);
 
-    if !resp.status().is_success() {
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            client
+                .post(&url)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Gemini API timed out after {}s", timeout_secs))?
+        .context("Failed to reach Gemini API")?;
+
+        if resp.status().is_success() {
+            let json: serde_json::Value = resp.json().await.context("Failed to parse Gemini response")?;
+            return extract_text(&json, &["candidates", "0", "content", "parts", "0", "text"])
+                .ok_or_else(|| anyhow::anyhow!("Unexpected Gemini response shape: {}", json));
+        }
+
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+
+        if status.as_u16() == 429 && attempts < max_attempts {
+            warn!("Gemini API rate limited (429), retrying in 2s... (attempt {}/{})", attempts, max_attempts);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+
+        // Improved error message for debugging
         anyhow::bail!("Gemini API error {}: {}", status, text);
     }
-
-    let json: serde_json::Value = resp.json().await.context("Failed to parse Gemini response")?;
-    extract_text(&json, &["candidates", "0", "content", "parts", "0", "text"])
-        .ok_or_else(|| anyhow::anyhow!("Unexpected Gemini response shape: {}", json))
 }
 
 // ── Ollama (local) ────────────────────────────────────────────────────────────

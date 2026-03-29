@@ -185,7 +185,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
     components::keybind_bar::render(
         frame,
         chunks[2],
-        &[("[Esc]", "Back"), ("[?]", "Help")],
+        &[("[Esc]", "Back"), ("[L]", "Reload"), ("[?]", "Help")],
         &t,
     );
 }

@@ -35,6 +35,8 @@ pub enum AppEvent {
     FixTaskDone(usize),
     /// The fix-task at `index` failed with the given error message.
     FixTaskFailed(usize, String),
+    /// Emitted when configuration is reloaded from disk.
+    ConfigReloaded(crate::config::AppConfig, Vec<crate::agents::models::AgentDefinition>),
 }
 
 /// Spawn a background thread that polls crossterm key events.

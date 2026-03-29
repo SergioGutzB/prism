@@ -220,6 +220,33 @@ async fn main() -> Result<()> {
                         app.github_user = Some(login);
                     }
 
+                    AppEvent::ConfigReloaded(cfg, agents) => {
+                        info!("Configuration reloaded from disk");
+                        let old_github = app.config.github.clone();
+                        app.config = cfg.clone();
+                        app.agents = agents;
+                        app.set_status("Configuration reloaded.");
+                        
+                        // If GitHub credentials changed, reload PR list
+                        if cfg.github.token != old_github.token || 
+                           cfg.github.owner != old_github.owner || 
+                           cfg.github.repo != old_github.repo 
+                        {
+                            if cfg.is_github_configured() {
+                                app.pr_list_loading = true;
+                                app.pr_list.clear();
+                                let tx = event_tx.clone();
+                                let c = cfg.clone();
+                                tokio::spawn(async move {
+                                    match load_pr_list(&c).await {
+                                        Ok(prs) => { let _ = tx.send(AppEvent::PrListLoaded(prs)); }
+                                        Err(e) => { let _ = tx.send(AppEvent::Error(format!("Failed to reload PRs: {e}"))); }
+                                    }
+                                });
+                            }
+                        }
+                    }
+
                     AppEvent::ReviewsLoaded(reviews, comments) => {
                         use review::models::{CommentSource, CommentStatus, GeneratedComment, Severity};
                         let draft = app.draft.get_or_insert_with(|| {
@@ -945,6 +972,22 @@ async fn handle_action(
             app.navigate_to(Screen::Settings);
         }
 
+        Action::ReloadConfig => {
+            let tx = event_tx.clone();
+            app.set_status("Reloading configuration…");
+            tokio::spawn(async move {
+                match crate::config::AppConfig::load() {
+                    Ok(cfg) => {
+                        let agents = crate::agents::loader::load_agents(&cfg).unwrap_or_default();
+                        let _ = tx.send(AppEvent::ConfigReloaded(cfg, agents));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::Error(format!("Failed to reload config: {e}")));
+                    }
+                }
+            });
+        }
+
         Action::OpenBrowser => {
             let url = match &app.screen {
                 Screen::PrList => app.selected_pr().map(|p| p.html_url.clone()),
@@ -1262,13 +1305,10 @@ fn handle_agent_update(app: &mut App, update: agents::orchestrator::AgentUpdate)
                 for (id, status) in &app.agent_statuses {
                     if let AgentStatus::Done { comments, .. } = status {
                         for c in comments {
-                            // Only add if not already present (avoid double-add on re-render)
-                            if !draft.comments.iter().any(|existing| existing.id == c.id) {
-                                draft.comments.push(c.clone());
-                            }
+                            // Use add_comment to enable our new de-duplication logic
+                            draft.add_comment(c.clone());
                         }
-                    }
-                    let _ = id;
+                    }                    let _ = id;
                 }
             }
             app.navigate_to(Screen::DoubleCheck);
