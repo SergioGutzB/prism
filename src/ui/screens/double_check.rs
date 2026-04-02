@@ -104,6 +104,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         ("[Tab]", "← List")
     };
 
+    let fix_label = format!("Fix with {}", app.config.llm.provider);
+
     keybind_bar::render(
         frame,
         chunks[2],
@@ -113,12 +115,14 @@ pub fn render(frame: &mut Frame, app: &App) {
             ("[Space]", "Toggle"),
             pane_hint,
             ("[c]", "New comment"),
+            ("[g]", "Edit comment"),
             ("[A]", "Approve all"),
             ("[D]", "Reject all"),
+            ("[Del]", "Delete"),
             ("[P]", "Preview"),
             ("[r]", "Run missing"),
             ("[R]", "Restart"),
-            ("[C]", "→ Claude Code"),
+            ("[F]", &fix_label),
             ("[1-7]", "Filter agent"),
             ("[?]", "Help"),
         ],
@@ -171,13 +175,18 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     );
 }
 
-fn filtered_comments<'a>(app: &'a App) -> Vec<(usize, &'a crate::review::models::GeneratedComment)> {
+/// Returns comments in threaded order: `(orig_idx, comment, depth)`.
+/// depth=0 → root comment, depth=1 → reply.
+/// Roots appear first; their replies follow immediately after them.
+/// agent_filter=Some(n) shows only that agent (0 = manual/github).
+pub fn threaded_comments<'a>(app: &'a App) -> Vec<(usize, &'a crate::review::models::GeneratedComment, usize)> {
     let draft = match &app.draft {
         Some(d) => d,
         None => return vec![],
     };
 
-    draft
+    // Apply agent filter
+    let visible: Vec<(usize, &crate::review::models::GeneratedComment)> = draft
         .comments
         .iter()
         .enumerate()
@@ -185,22 +194,73 @@ fn filtered_comments<'a>(app: &'a App) -> Vec<(usize, &'a crate::review::models:
             if let Some(filter_idx) = app.agent_filter {
                 match &c.source {
                     CommentSource::Agent { agent_id, .. } => {
-                        let idx = app
-                            .agents
-                            .iter()
+                        let idx = app.agents.iter()
                             .position(|a| a.agent.id == *agent_id)
                             .map(|i| i as u8 + 1)
                             .unwrap_or(0);
-                        if idx != filter_idx {
-                            return false;
-                        }
+                        return idx == filter_idx;
                     }
-                    CommentSource::Manual => return filter_idx == 0,
+                    CommentSource::Manual | CommentSource::GithubReview { .. } => {
+                        return filter_idx == 0;
+                    }
                 }
             }
             true
         })
-        .collect()
+        .collect();
+
+    // Build set of github_ids present in the visible list
+    let visible_github_ids: std::collections::HashSet<u64> = visible
+        .iter()
+        .filter_map(|(_, c)| c.github_id)
+        .collect();
+
+    // Separate roots from replies
+    let (roots, replies): (Vec<_>, Vec<_>) = visible.into_iter().partition(|(_, c)| {
+        c.parent_github_id
+            .map(|pid| !visible_github_ids.contains(&pid))
+            .unwrap_or(true)
+    });
+
+    // Build reply map: parent_github_id → sorted Vec<(orig_idx, comment)>
+    let mut reply_map: std::collections::HashMap<u64, Vec<(usize, &crate::review::models::GeneratedComment)>> =
+        std::collections::HashMap::new();
+    for (orig_idx, c) in replies {
+        if let Some(pid) = c.parent_github_id {
+            reply_map.entry(pid).or_default().push((orig_idx, c));
+        }
+    }
+    // Sort replies within each thread by created_at
+    for v in reply_map.values_mut() {
+        v.sort_by_key(|(_, c)| c.created_at);
+    }
+
+    // Build output: root then its replies
+    let mut result = Vec::new();
+    for (orig_idx, root) in roots {
+        result.push((orig_idx, root, 0usize));
+        if let Some(root_gh_id) = root.github_id {
+            if let Some(children) = reply_map.get(&root_gh_id) {
+                for (cidx, child) in children {
+                    result.push((*cidx, *child, 1usize));
+                }
+            }
+        }
+    }
+    result
+}
+
+/// How many visible (filtered + threaded) comments there are — for navigation bounds.
+pub fn visible_comment_count(app: &App) -> usize {
+    threaded_comments(app).len()
+}
+
+/// Return the comment at visual position `idx` together with its original draft index.
+pub fn comment_at(app: &App, visual_idx: usize) -> Option<(usize, &crate::review::models::GeneratedComment)> {
+    threaded_comments(app)
+        .into_iter()
+        .nth(visual_idx)
+        .map(|(orig, c, _)| (orig, c))
 }
 
 fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
@@ -212,7 +272,7 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     };
     let border_color = if focused { t.border_focused } else { t.border };
 
-    let comments = filtered_comments(app);
+    let comments = threaded_comments(app);
 
     if comments.is_empty() {
         let msg = if app.draft.as_ref().map(|d| d.comments.is_empty()).unwrap_or(true) {
@@ -234,41 +294,62 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         return;
     }
 
+    // Build reply-count map for root comments
+    let reply_counts: std::collections::HashMap<u64, usize> = {
+        let mut m = std::collections::HashMap::new();
+        for (_, c, depth) in &comments {
+            if *depth > 0 {
+                if let Some(pid) = c.parent_github_id {
+                    *m.entry(pid).or_insert(0usize) += 1;
+                }
+            }
+        }
+        m
+    };
+
     let items: Vec<ListItem> = comments
         .iter()
-        .map(|(orig_i, comment)| {
-            let selected = *orig_i == app.double_check_selected;
+        .enumerate()
+        .map(|(visual_i, (_, comment, depth))| {
+            let selected = visual_i == app.double_check_selected;
+            let is_reply = *depth > 0;
+
             let status_icon = match comment.status {
                 CommentStatus::Approved => Span::styled("✓ ", Style::default().fg(t.agent_done)),
                 CommentStatus::Rejected => Span::styled("✗ ", Style::default().fg(t.agent_failed)),
-                CommentStatus::Pending => Span::styled("○ ", Style::default().fg(t.muted)),
+                CommentStatus::Pending  => Span::styled("○ ", Style::default().fg(t.muted)),
             };
 
             let sev_color = match comment.severity {
-                Severity::Critical => t.critical,
-                Severity::Warning => t.warning,
+                Severity::Critical  => t.critical,
+                Severity::Warning   => t.warning,
                 Severity::Suggestion => t.suggestion,
-                Severity::Praise => t.praise,
+                Severity::Praise    => t.praise,
             };
 
             let source = match &comment.source {
-                CommentSource::Agent { agent_icon, agent_name, .. } => {
-                    format!("{} {}", agent_icon, agent_name)
-                }
+                CommentSource::Agent { agent_icon, agent_name, .. } => format!("{} {}", agent_icon, agent_name),
                 CommentSource::Manual => "✍ manual".to_string(),
+                CommentSource::GithubReview { user, state, .. } => format!("💬 {} ({})", user, state),
             };
 
+            // Reply count suffix for root comments
+            let reply_suffix = if !is_reply {
+                comment.github_id
+                    .and_then(|gid| reply_counts.get(&gid))
+                    .map(|n| format!(" [{} repl{}]", n, if *n == 1 { "y" } else { "ies" }))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let indent = if is_reply { "  ↳ " } else { "" };
             let file_info = match &comment.file_path {
                 Some(f) => {
-                    // Truncate long paths
-                    let short = if f.len() > 20 {
-                        format!("…{}", &f[f.len() - 19..])
-                    } else {
-                        f.clone()
-                    };
-                    format!(" {}:{}", short, comment.line.unwrap_or(0))
+                    let short = if f.len() > 18 { format!("…{}", &f[f.len()-17..]) } else { f.clone() };
+                    format!("{} {}:{}", indent, short, comment.line.unwrap_or(0))
                 }
-                None => String::new(),
+                None => indent.to_string(),
             };
 
             let row_style = if selected && focused {
@@ -282,21 +363,20 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 Span::styled(format!("[{}]", comment.severity), Style::default().fg(sev_color)),
                 Span::styled(file_info, Style::default().fg(t.suggestion)),
             ]);
-            let line2 = Line::from(Span::styled(
-                format!("  {}", source),
-                Style::default().fg(t.muted),
-            ));
+            let line2 = Line::from(vec![
+                Span::styled(
+                    format!("  {}{}", if is_reply { "  " } else { "" }, source),
+                    Style::default().fg(t.muted),
+                ),
+                Span::styled(reply_suffix, Style::default().fg(t.warning)),
+            ]);
 
             ListItem::new(vec![line1, line2]).style(row_style)
         })
         .collect();
 
     let mut list_state = ListState::default();
-    let display_selected = comments
-        .iter()
-        .position(|(i, _)| *i == app.double_check_selected)
-        .unwrap_or(0);
-    list_state.select(Some(display_selected));
+    list_state.select(Some(app.double_check_selected.min(comments.len().saturating_sub(1))));
 
     let list = List::new(items)
         .block(
@@ -315,7 +395,7 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let visible_height = area.height.saturating_sub(2) as usize;
     if total_items > visible_height {
         let max_s = total_items.saturating_sub(visible_height);
-        let pos = display_selected.min(max_s);
+        let pos = app.double_check_selected.min(max_s);
         let mut sb_state = ScrollbarState::new(max_s).position(pos);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -338,11 +418,7 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     };
     let border_color = if focused { t.border_focused } else { t.border };
 
-    let comments = filtered_comments(app);
-    let selected_comment = comments
-        .iter()
-        .find(|(i, _)| *i == app.double_check_selected)
-        .map(|(_, c)| *c);
+    let selected_comment = comment_at(app, app.double_check_selected).map(|(_, c)| c);
 
     let comment = match selected_comment {
         Some(c) => c,
@@ -380,6 +456,22 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
             format!("{} {}", agent_icon, agent_name)
         }
         CommentSource::Manual => "✍ Manual".to_string(),
+        CommentSource::GithubReview { user, state, .. } => format!("💬 GitHub Review — {} ({})", user, state),
+    };
+
+    // Thread info: show parent ref + reply count for this comment
+    let thread_info: Option<String> = if comment.parent_github_id.is_some() {
+        Some("  ↳ reply in thread".to_string())
+    } else {
+        let replies = threaded_comments(app)
+            .into_iter()
+            .filter(|(_, c, _)| c.parent_github_id == comment.github_id && comment.github_id.is_some())
+            .count();
+        if replies > 0 {
+            Some(format!("  {} repl{} in thread", replies, if replies == 1 { "y" } else { "ies" }))
+        } else {
+            None
+        }
     };
 
     let location_line = match (&comment.file_path, comment.line) {
@@ -397,12 +489,15 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ]),
         Line::from(Span::styled(source_line, Style::default().fg(t.muted))),
         Line::from(Span::styled(location_line, Style::default().fg(t.suggestion))),
-        Line::from(Span::styled(
-            "─".repeat(area.width.saturating_sub(4) as usize),
-            Style::default().fg(t.border),
-        )),
-        Line::from(""),
     ];
+    if let Some(tinfo) = thread_info {
+        lines.push(Line::from(Span::styled(tinfo, Style::default().fg(t.warning))));
+    }
+    lines.push(Line::from(Span::styled(
+        "─".repeat(area.width.saturating_sub(4) as usize),
+        Style::default().fg(t.border),
+    )));
+    lines.push(Line::from(""));
 
     // Code context block — shown when the comment is tied to a specific file+line
     if let (Some(file_path), Some(target_line)) = (&comment.file_path, comment.line) {

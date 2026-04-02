@@ -148,8 +148,10 @@ pub enum Action {
     ClearCache,
     Char(char),
     FilterAgent(u8),
-    ClaudeCodeFix,
+    AiFix,
     ReloadConfig,
+    AgentWizard,
+    ToggleSplitDiff,
 }
 
 /// Map a raw `KeyEvent` to an `Action` given the current input mode.
@@ -219,19 +221,22 @@ pub fn map_key(key: &KeyEvent, mode: &InputMode) -> Option<Action> {
                 KeyCode::Char('f') => Some(Action::FileTree),
                 KeyCode::Char('i') => Some(Action::EnterInsert),
                 KeyCode::Char('z') => Some(Action::ToggleFullscreen),
+                KeyCode::Char('Z') => Some(Action::ToggleSplitDiff),
                 KeyCode::Char('v') => Some(Action::OpenDoubleCheck),
                 KeyCode::Char('s') => Some(Action::InsertSuggestion),
                 KeyCode::Char('g') => Some(Action::GenerateBody),
                 KeyCode::Char('?') => Some(Action::Help),
                 KeyCode::Char('T') => Some(Action::ShowStats),
                 KeyCode::Char('R') => Some(Action::RestartReview),
-                KeyCode::Char('C') => Some(Action::ClaudeCodeFix),
+                KeyCode::Char('F') => Some(Action::AiFix),
                 KeyCode::Char('X') => Some(Action::ClearCache),
                 KeyCode::Char('L') => Some(Action::ReloadConfig),
+                KeyCode::Char('w') => Some(Action::AgentWizard),
                 // Filter by agent number (1-7)
                 KeyCode::Char(c @ '1'..='7') => {
                     Some(Action::FilterAgent(c as u8 - b'0'))
                 }
+                KeyCode::Delete => Some(Action::Delete),
                 _ => None,
             }
         }

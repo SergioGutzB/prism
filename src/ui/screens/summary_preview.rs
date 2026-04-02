@@ -158,6 +158,7 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
             let source = match &c.source {
                 CommentSource::Agent { agent_name, .. } => agent_name.as_str(),
                 CommentSource::Manual => "manual",
+                CommentSource::GithubReview { .. } => "github",
             };
             let file_info = match &c.file_path {
                 Some(f) => format!(" {}:{}", f, c.line.unwrap_or(0)),

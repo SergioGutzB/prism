@@ -194,7 +194,9 @@ impl ReviewContext {
 
         for (path, section) in included_sections {
             if diff.len() + section.len() <= max_chars {
-                diff.push_str(&section);
+                // Enrich each file section with semantic context labels
+                let enriched = enrich_diff_with_context(&section);
+                diff.push_str(&enriched);
                 files_included += 1;
             } else {
                 truncated_names.push(path);
@@ -330,6 +332,41 @@ impl PreparedDiff {
     pub fn estimated_tokens(&self) -> usize {
         self.diff.len() * 10 / 35
     }
+}
+
+// ── Semantic Diff Analysis ───────────────────────────────────────────────────
+
+/// Extract the function or class name from a diff hunk header (the text after @@ ... @@).
+/// Example: "@@ -10,5 +10,6 @@ fn my_function() {" -> Some("fn my_function()")
+fn get_context_from_hunk_header(header: &str) -> Option<String> {
+    if let Some(idx) = header.find("@@") {
+        let after_at = &header[idx + 2..];
+        if let Some(end_idx) = after_at.find("@@") {
+            let context = &after_at[end_idx + 2..].trim();
+            if !context.is_empty() {
+                return Some(context.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Process a raw diff and inject semantic context labels before each hunk.
+/// This helps the LLM understand WHICH function or class is being modified.
+pub fn enrich_diff_with_context(diff: &str) -> String {
+    let mut enriched = String::with_capacity(diff.len() + 1024);
+    
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            if let Some(ctx) = get_context_from_hunk_header(line) {
+                enriched.push_str(&format!("\n[Context: {}]\n", ctx));
+            }
+        }
+        enriched.push_str(line);
+        enriched.push('\n');
+    }
+    
+    enriched
 }
 
 // ── Diff splitting ────────────────────────────────────────────────────────────

@@ -41,6 +41,11 @@ impl CachedComment {
                 "Manual".to_string(),
                 "✏️".to_string(),
             ),
+            CommentSource::GithubReview { user, .. } => (
+                "github".to_string(),
+                user.clone(),
+                "💬".to_string(),
+            ),
         };
         Self {
             file_path: c.file_path.clone(),

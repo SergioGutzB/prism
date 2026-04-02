@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub struct GeneratedComment {
     pub id: uuid::Uuid,
+    /// GitHub comment id — set when imported from GitHub, used for update/delete.
+    pub github_id: Option<u64>,
+    /// For reply comments: the github_id of the parent comment in the thread.
+    pub parent_github_id: Option<u64>,
     pub source: CommentSource,
     pub file_path: Option<String>,
     pub line: Option<u32>,
@@ -24,6 +28,8 @@ impl GeneratedComment {
     ) -> Self {
         Self {
             id: uuid::Uuid::new_v4(),
+            github_id: None,
+            parent_github_id: None,
             source,
             file_path,
             line,
@@ -48,12 +54,18 @@ pub enum CommentSource {
         agent_icon: String,
     },
     Manual,
+    /// A top-level review summary fetched from GitHub (not an inline comment).
+    GithubReview {
+        review_id: u64,
+        state: String,
+        user: String,
+    },
 }
 
 impl CommentSource {
     pub fn score(&self) -> u8 {
         match self {
-            CommentSource::Manual => 2,
+            CommentSource::Manual | CommentSource::GithubReview { .. } => 2,
             CommentSource::Agent { .. } => 1,
         }
     }
@@ -248,6 +260,63 @@ impl ReviewDraft {
         }
     }
 
+    pub fn merge_github_reviews(&mut self, reviews: Vec<crate::github::models::GhReview>, comments: Vec<crate::github::models::GhPrComment>) {
+        use crate::github::models::GhReviewState;
+
+        // Top-level review summaries (the overall review body)
+        for review in reviews {
+            if review.body.trim().is_empty() { continue; }
+            let state_str = match review.state {
+                GhReviewState::Approved => "approved",
+                GhReviewState::ChangesRequested => "changes_requested",
+                GhReviewState::Commented => "commented",
+                GhReviewState::Dismissed => "dismissed",
+                GhReviewState::Unknown => "unknown",
+            };
+            let severity = match review.state {
+                GhReviewState::Approved => Severity::Praise,
+                GhReviewState::ChangesRequested => Severity::Warning,
+                _ => Severity::Suggestion,
+            };
+            let gen_comment = GeneratedComment {
+                id: uuid::Uuid::new_v4(),
+                github_id: Some(review.id),
+                parent_github_id: None,
+                source: CommentSource::GithubReview {
+                    review_id: review.id,
+                    state: state_str.to_string(),
+                    user: review.user.login.clone(),
+                },
+                file_path: None,
+                line: None,
+                body: review.body,
+                edited_body: None,
+                severity,
+                status: CommentStatus::Approved,
+                created_at: review.submitted_at.unwrap_or_else(chrono::Utc::now),
+            };
+            self.add_comment(gen_comment);
+        }
+
+        // Inline review comments (including threaded replies)
+        for gh_c in comments {
+            let gen_comment = GeneratedComment {
+                id: uuid::Uuid::new_v4(),
+                github_id: Some(gh_c.id),
+                parent_github_id: gh_c.in_reply_to_id,
+                source: CommentSource::Manual,
+                file_path: Some(gh_c.path),
+                line: gh_c.line,
+                body: gh_c.body,
+                edited_body: None,
+                severity: Severity::Suggestion,
+                status: CommentStatus::Approved,
+                created_at: gh_c.created_at,
+            };
+            self.add_comment(gen_comment);
+        }
+    }
+
     pub fn approve_all(&mut self) {
         for comment in &mut self.comments {
             if comment.status == CommentStatus::Pending {
@@ -313,6 +382,7 @@ impl ReviewDraft {
             let source = match &c.source {
                 CommentSource::Agent { agent_name, .. } => agent_name.as_str(),
                 CommentSource::Manual => "manual",
+                CommentSource::GithubReview { .. } => "github",
             };
             fmt.comment_template
                 .replace("{file}", file)

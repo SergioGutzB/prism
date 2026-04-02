@@ -137,6 +137,9 @@ pub struct GhPrComment {
     pub body: String,
     pub path: String,
     pub line: Option<u32>,
+    /// Set on reply comments — the id of the parent comment in the thread.
+    #[serde(default)]
+    pub in_reply_to_id: Option<u64>,
     pub created_at: DateTime<Utc>,
 }
 

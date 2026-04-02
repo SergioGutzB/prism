@@ -50,7 +50,7 @@ impl Orchestrator {
         &self,
         agents: Vec<AgentDefinition>,
         ctx: ReviewContext,
-    ) -> mpsc::Receiver<AgentUpdate> {
+    ) -> (mpsc::Receiver<AgentUpdate>, tokio::task::AbortHandle) {
         let (tx, rx) = mpsc::channel::<AgentUpdate>(256);
         let runner = Arc::clone(&self.runner);
         let concurrency = self.concurrency;
@@ -62,7 +62,7 @@ impl Orchestrator {
 
         let ctx = Arc::new(ctx);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // ── Separate disabled / phase_zero / specialists / synthesis ───
             let mut disabled: Vec<AgentDefinition> = Vec::new();
             let mut phase_zero: Vec<AgentDefinition> = Vec::new();
@@ -139,7 +139,8 @@ impl Orchestrator {
             info!("All agents completed");
         });
 
-        rx
+        let abort = handle.abort_handle();
+        (rx, abort)
     }
 }
 

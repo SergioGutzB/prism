@@ -1,6 +1,7 @@
 use config::{Config, Environment, File, FileFormat};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 use crate::error::Result;
 
@@ -13,6 +14,23 @@ pub struct AppConfig {
     pub ui: UiConfig,
     #[serde(default)]
     pub publishing: PublishingConfig,
+    #[serde(default)]
+    pub editor: EditorConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EditorConfig {
+    pub command: String,           // e.g. "nvim", "vim", "code --wait"
+    pub internal_vim: bool,        // Use internal tui-textarea vim mode
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            command: "nvim".to_string(),
+            internal_vim: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -62,9 +80,14 @@ pub struct GitHubConfig {
     pub per_page: u32,
 }
 
+impl GitHubConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.token.is_empty() && !self.owner.is_empty() && !self.repo.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TicketsConfig {
-    #[serde(default)]
     pub providers: Vec<TicketProviderConfig>,
 }
 
@@ -81,49 +104,33 @@ pub struct TicketProviderConfig {
     pub api_token: String,
     #[serde(default)]
     pub api_key: String,
-    #[serde(default)]
     pub key_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LlmConfig {
-    /// LLM backend. Supported values:
-    /// "claude-cli"  — Claude Code CLI (`claude --print`), no API key needed
-    /// "anthropic"   — Direct Anthropic Messages API (ANTHROPIC_API_KEY)
-    /// "openai"      — OpenAI Chat Completions API (OPENAI_API_KEY)
-    /// "gemini"      — Google Gemini API (GEMINI_API_KEY or GOOGLE_API_KEY)
-    /// "ollama"      — Local Ollama server (no key, set base_url if non-default)
     pub provider: String,
     pub model: String,
     pub max_tokens: u32,
     pub temperature: f32,
-    /// API key. If empty, falls back to the provider's standard env var.
     #[serde(default)]
     pub api_key: String,
-    /// Override the API base URL (e.g. Azure OpenAI endpoint, custom Ollama host).
-    /// Leave empty to use the provider's default endpoint.
     #[serde(default)]
     pub base_url: String,
 }
 
 impl LlmConfig {
-    /// Resolve the API key: config field takes priority, then env var.
+    /// Resolve the API key: config field takes priority, then environment variables.
     pub fn effective_api_key(&self) -> String {
         if !self.api_key.is_empty() {
             return self.api_key.clone();
         }
         match self.provider.as_str() {
-            "anthropic" | "claude" | "claude-cli" => {
-                std::env::var("ANTHROPIC_API_KEY").unwrap_or_default()
-            }
-            "openai" | "codex" => {
-                std::env::var("OPENAI_API_KEY").unwrap_or_default()
-            }
-            "gemini" => {
-                std::env::var("GEMINI_API_KEY")
-                    .or_else(|_| std::env::var("GOOGLE_API_KEY"))
-                    .unwrap_or_default()
-            }
+            "anthropic" => std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+            "openai" | "codex" => std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+            "gemini" => std::env::var("GEMINI_API_KEY")
+                .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+                .unwrap_or_default(),
             _ => String::new(),
         }
     }
@@ -153,38 +160,21 @@ pub struct AgentsConfig {
     pub max_diff_tokens: u32,
     /// Review strictness level. Controls how much the AI focuses on issues.
     /// Values: "critical_only" | "strict" | "moderate" | "light"
-    #[serde(default = "default_review_rigor")]
+    #[serde(default = "default_rigor")]
     pub review_rigor: String,
 }
 
-fn default_review_rigor() -> String {
+fn default_rigor() -> String {
     "moderate".to_string()
 }
 
 impl AgentsConfig {
-    /// Returns a system-prompt prefix that adjusts agent behavior based on rigor level.
-    pub fn rigor_prefix(&self) -> &'static str {
+    pub fn rigor_prefix(&self) -> &str {
         match self.review_rigor.as_str() {
-            "critical_only" => {
-                "IMPORTANT CONSTRAINT: Only report CRITICAL issues — security vulnerabilities, \
-                 data-loss bugs, crashes, or breaking API changes. If nothing critical is found, \
-                 return an empty array []. Do NOT report style issues, minor suggestions, or \
-                 anything that does not have a direct functional impact.\n\n"
-            }
-            "strict" => {
-                "REVIEW MODE: Strict. Be thorough and rigorous. Flag all potential issues \
-                 including style inconsistencies, performance concerns, maintainability problems, \
-                 and correctness issues. Include minor suggestions where relevant.\n\n"
-            }
-            "light" => {
-                "REVIEW MODE: Light. Focus only on significant bugs and clear improvements. \
-                 Avoid nitpicking style, naming, or trivial formatting. Only report issues \
-                 that clearly matter for correctness or maintainability.\n\n"
-            }
-            _ => {
-                // "moderate" — no extra prefix, default agent behavior
-                ""
-            }
+            "critical_only" => "CRITICAL ISSUES ONLY: Focus only on severe security vulnerabilities or major architectural flaws. Skip minor stylistic or optimization suggestions.\n\n",
+            "strict" => "STRICT REVIEW: Focus on security, correctness, and major architectural patterns. Be very selective with suggestions.\n\n",
+            "light" => "LIGHT REVIEW: Be encouraging. Focus on helpful suggestions and minor improvements. Don't be too pedantic.\n\n",
+            _ => "", // moderate is default
         }
     }
 }
@@ -192,14 +182,14 @@ impl AgentsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UiConfig {
     pub theme: String,
-    pub diff_context_lines: u32,
+    pub diff_context_lines: usize,
     pub show_line_numbers: bool,
     pub highlight_syntax: bool,
-    pub keybindings: KeyBindings,
+    pub keybindings: KeybindingsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct KeyBindings {
+pub struct KeybindingsConfig {
     pub quit: String,
     pub back: String,
     pub confirm: String,
@@ -222,158 +212,136 @@ pub struct KeyBindings {
 
 impl AppConfig {
     pub fn load() -> Result<Self> {
-        let default_config = include_str!("../config/default.toml");
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let config_path = PathBuf::from(home)
+            .join(".config")
+            .join("prism")
+            .join("config.toml");
 
-        let user_config_path = dirs_user_config();
+        let mut s = Config::builder();
 
-        let mut builder = Config::builder()
-            .add_source(File::from_str(default_config, FileFormat::Toml))
-            .add_source(
-                File::with_name(
-                    user_config_path
-                        .to_str()
-                        .unwrap_or("~/.config/prism/config"),
-                )
-                .required(false),
-            )
-            // GitHub env vars
-            .add_source(
-                Environment::with_prefix("GITHUB")
-                    .prefix_separator("_")
-                    .separator("__")
-                    .try_parsing(true),
-            )
-            // Jira env vars
-            .add_source(
-                Environment::with_prefix("JIRA")
-                    .prefix_separator("_")
-                    .separator("__")
-                    .try_parsing(true),
-            )
-            // Linear env vars
-            .add_source(
-                Environment::with_prefix("LINEAR")
-                    .prefix_separator("_")
-                    .separator("__")
-                    .try_parsing(true),
-            )
-            // Anthropic / OpenAI
-            .add_source(
-                Environment::with_prefix("ANTHROPIC")
-                    .prefix_separator("_")
-                    .separator("__")
-                    .try_parsing(true),
-            )
-            .add_source(
-                Environment::with_prefix("OPENAI")
-                    .prefix_separator("_")
-                    .separator("__")
-                    .try_parsing(true),
-            );
+        // 1. Start with hardcoded defaults (optional, could be in a separate file)
+        s = s.add_source(File::from_str(
+            include_str!("../config/default.toml"),
+            FileFormat::Toml,
+        ));
 
-        // Override specific keys from individual env vars
-        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            builder = builder.set_override("github.token", token)?;
-        }
-        if let Ok(owner) = std::env::var("GITHUB_OWNER") {
-            builder = builder.set_override("github.owner", owner)?;
-        }
-        if let Ok(repo) = std::env::var("GITHUB_REPO") {
-            builder = builder.set_override("github.repo", repo)?;
-        }
-        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-            builder = builder.set_override("llm.api_key", api_key)?;
+        // 2. Load from ~/.config/prism/config.toml
+        if config_path.exists() {
+            s = s.add_source(File::from(config_path));
         }
 
-        let cfg = builder.build()?;
-        let app_config: AppConfig = cfg.try_deserialize()?;
-        Ok(app_config)
+        // 3. Environment variables (PRISM_GITHUB__TOKEN etc.)
+        s = s.add_source(Environment::with_prefix("PRISM").separator("__"));
+
+        let cfg: AppConfig = s.build()?.try_deserialize()?;
+        Ok(cfg)
+    }
+
+    pub fn gh_token() -> Option<String> {
+        std::process::Command::new("gh")
+            .args(["auth", "token"])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn gh_current_repo() -> Option<(String, String)> {
+        std::process::Command::new("gh")
+            .args(["repo", "view", "--json", "owner,name", "--template", "{{.owner.login}}:{{.name}}"])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let parts: Vec<&str> = s.split(':').collect();
+                    if parts.len() == 2 {
+                        Some((parts[0].to_string(), parts[1].to_string()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
     }
 
     pub fn is_github_configured(&self) -> bool {
-        !self.github.token.is_empty()
-            && !self.github.owner.is_empty()
-            && !self.github.repo.is_empty()
+        !self.github.token.is_empty() && !self.github.owner.is_empty() && !self.github.repo.is_empty()
     }
 
     pub fn is_llm_configured(&self) -> bool {
-        match self.llm.provider.as_str() {
-            "claude-cli" | "claude" => Self::is_claude_cli_available(),
-            "ollama" => true, // local, no key required
-            _ => !self.llm.effective_api_key().is_empty(),
-        }
+        self.llm.effective_api_key().len() > 5 || self.llm.provider == "claude-cli" || self.llm.provider == "ollama"
     }
 
-    /// Check if the `claude` CLI is available in PATH.
-    pub fn is_claude_cli_available() -> bool {
-        std::process::Command::new("claude")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
+    pub fn save_github_config(token: &str, owner: &str, repo: &str) -> Result<()> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let config_dir = PathBuf::from(home).join(".config").join("prism");
+        let config_path = config_dir.join("config.toml");
 
-    /// Try to get a GitHub token from the `gh` CLI (`gh auth token`).
-    pub fn gh_token() -> Option<String> {
-        let out = std::process::Command::new("gh")
-            .args(["auth", "token"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let token = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        if token.is_empty() { None } else { Some(token) }
-    }
-
-    /// Try to detect owner/repo from the current git remote via `gh repo view`.
-    pub fn gh_current_repo() -> Option<(String, String)> {
-        let out = std::process::Command::new("gh")
-            .args(["repo", "view", "--json", "owner,name"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-        let owner = v["owner"]["login"].as_str()?.to_string();
-        let name  = v["name"].as_str()?.to_string();
-        Some((owner, name))
-    }
-
-    /// Persist GitHub credentials to `~/.config/prism/config.toml`.
-    /// Creates the file if it doesn't exist; merges with existing content.
-    pub fn save_github_config(token: &str, owner: &str, repo: &str) -> anyhow::Result<()> {
-        let path = dirs_user_config();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+        if !config_dir.exists() {
+            std::fs::create_dir_all(&config_dir)?;
         }
 
-        // Read existing TOML (if any) so we don't lose other settings
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut doc: toml::Table = existing.parse().unwrap_or_default();
+        let mut doc = if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            content.parse::<toml_edit::DocumentMut>().unwrap_or_default()
+        } else {
+            toml_edit::DocumentMut::new()
+        };
 
-        let github = doc
-            .entry("github")
-            .or_insert(toml::Value::Table(toml::Table::new()))
-            .as_table_mut()
-            .cloned()
-            .unwrap_or_default();
+        let github = &mut doc["github"];
+        github["token"] = toml_edit::value(token);
+        github["owner"] = toml_edit::value(owner);
+        github["repo"] = toml_edit::value(repo);
 
-        let mut gh = github;
-        gh.insert("token".into(), toml::Value::String(token.to_string()));
-        gh.insert("owner".into(), toml::Value::String(owner.to_string()));
-        gh.insert("repo".into(),  toml::Value::String(repo.to_string()));
-        doc.insert("github".into(), toml::Value::Table(gh));
-
-        std::fs::write(&path, toml::to_string_pretty(&doc)?)?;
+        std::fs::write(config_path, doc.to_string())?;
         Ok(())
+    }
+
+    pub fn save_user_config(&self) -> Result<()> {
+        let path = dirs_user_config();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let doc = toml::to_string_pretty(&self)?;
+        std::fs::write(path, doc)?;
+        Ok(())
+    }
+
+    pub fn load_stats() -> HashMap<String, crate::app::ModelStats> {
+        let path = dirs_stats_file();
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                return serde_json::from_str(&content).unwrap_or_default();
+            }
+        }
+        HashMap::new()
+    }
+
+    pub fn save_stats(stats: &HashMap<String, crate::app::ModelStats>) {
+        let path = dirs_stats_file();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(content) = serde_json::to_string_pretty(stats) {
+            let _ = std::fs::write(path, content);
+        }
     }
 }
 
 fn dirs_user_config() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".config").join("prism").join("config.toml")
+}
+
+fn dirs_stats_file() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".config").join("prism").join("stats.json")
 }

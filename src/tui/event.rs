@@ -37,6 +37,10 @@ pub enum AppEvent {
     FixTaskFailed(usize, String),
     /// Emitted when configuration is reloaded from disk.
     ConfigReloaded(crate::config::AppConfig, Vec<crate::agents::models::AgentDefinition>),
+    /// A comment was successfully deleted from GitHub (carries local uuid to remove from draft).
+    CommentDeleted(uuid::Uuid),
+    /// A comment body was successfully updated on GitHub.
+    CommentUpdated(uuid::Uuid, String),
 }
 
 /// Spawn a background thread that polls crossterm key events.

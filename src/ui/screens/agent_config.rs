@@ -39,6 +39,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             ("[Esc]", "Back"),
             ("[jk]", "Nav"),
             ("[Space]", "Toggle enabled"),
+            ("[w]", "New Agent"),
         ],
         &t,
     );

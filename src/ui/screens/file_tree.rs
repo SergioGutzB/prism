@@ -25,17 +25,23 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_header(frame, app, chunks[0], &t);
 
-    // Split body: file list left (38%), detail panel right (62%)
-    let body = Layout::horizontal([
-        Constraint::Percentage(38),
-        Constraint::Percentage(62),
-    ])
-    .split(chunks[1]);
+    if app.file_tree_fullscreen && app.file_tree_pane == 1 {
+        // Fullscreen: the detail panel takes the full body area
+        render_detail(frame, app, chunks[1], &t);
+    } else {
+        // Normal split: file list left (38%), detail panel right (62%)
+        let body = Layout::horizontal([
+            Constraint::Percentage(38),
+            Constraint::Percentage(62),
+        ])
+        .split(chunks[1]);
 
-    render_table(frame, app, body[0], &t);
-    render_detail(frame, app, body[1], &t);
+        render_table(frame, app, body[0], &t);
+        render_detail(frame, app, body[1], &t);
+    }
 
     render_progress(frame, app, chunks[2], &t);
+
     if app.file_tree_pane == 0 {
         keybind_bar::render(
             frame,
@@ -49,6 +55,20 @@ pub fn render(frame: &mut Frame, app: &App) {
             ],
             &t,
         );
+    } else if app.file_tree_fullscreen {
+        let split_hint = if app.file_tree_split { ("[Z]", "Unified") } else { ("[Z]", "Split") };
+        keybind_bar::render(
+            frame,
+            chunks[3],
+            &[
+                ("[←/Esc]", "Exit full"),
+                ("[jk]", "Scroll"),
+                ("[c]", "Comment"),
+                ("[z]", "Exit full"),
+                split_hint,
+            ],
+            &t,
+        );
     } else {
         keybind_bar::render(
             frame,
@@ -58,6 +78,8 @@ pub fn render(frame: &mut Frame, app: &App) {
                 ("[jk]", "Navigate lines"),
                 ("[c]", "Comment line"),
                 ("[J/K]", "Scroll detail"),
+                ("[z]", "Fullscreen"),
+                ("[Z]", "Split"),
             ],
             &t,
         );
@@ -105,7 +127,7 @@ fn render_table(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .iter()
         .enumerate()
         .map(|(i, (path, checked))| {
-            let selected = i == app.pr_list_selected;
+            let selected = i == app.file_tree_line;
             let check = if *checked { "✓" } else { " " };
             let comment_count = draft
                 .comments
@@ -145,7 +167,7 @@ fn render_table(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     );
 
     let mut state = TableState::default();
-    state.select(Some(app.pr_list_selected));
+    state.select(Some(app.file_tree_line));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -165,7 +187,7 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         }
     };
 
-    let selected_path = draft.file_checklist.keys().nth(app.pr_list_selected);
+    let selected_path = draft.file_checklist.keys().nth(app.file_tree_line);
     let path = match selected_path {
         Some(p) => p,
         None => {
@@ -181,14 +203,14 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         }
     };
 
-    // Split detail area vertically: diff on top, comments below
     let file_comments: Vec<_> = draft
         .comments
         .iter()
         .filter(|c| c.file_path.as_deref() == Some(path.as_str()))
         .collect();
 
-    let comment_height = if file_comments.is_empty() {
+    // In fullscreen mode hide the comments panel to maximize diff space
+    let comment_height = if file_comments.is_empty() || app.file_tree_fullscreen {
         0u16
     } else {
         (file_comments.len() as u16 * 3).min(area.height / 3)
@@ -200,97 +222,100 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     ])
     .split(area);
 
-    // Diff section
     let diff_lines = extract_file_diff_lines(app, path);
-    let total = diff_lines.len();
-    let ext = path.rsplit('.').next();
+    let scroll = app.file_tree_scroll;
+    let focused = app.file_tree_pane == 1;
 
-    // Compute effective scroll — auto-scroll to keep file_tree_line visible
-    let show_cursor = app.file_tree_pane == 1;
-    let effective_scroll = if show_cursor {
-        let visible_h = detail_chunks[0].height.saturating_sub(2) as usize; // subtract border
-        if app.file_tree_line >= app.file_tree_scroll + visible_h {
-            app.file_tree_line + 1 - visible_h
-        } else if app.file_tree_line < app.file_tree_scroll {
-            app.file_tree_line
+    // In fullscreen mode delegate to the shared diff_view renderers
+    if app.file_tree_fullscreen {
+        if app.file_tree_split {
+            diff_view::render_split_lines(
+                frame,
+                detail_chunks[0],
+                &diff_lines,
+                scroll,
+                path,
+                None,
+                t,
+                focused,
+            );
         } else {
-            app.file_tree_scroll
+            diff_view::render_unified_lines(
+                frame,
+                detail_chunks[0],
+                &diff_lines,
+                scroll,
+                path,
+                None,
+                t,
+                focused,
+            );
         }
     } else {
-        app.file_tree_scroll.min(total.saturating_sub(1))
-    };
+        // Non-fullscreen: use the existing inline renderer
+        let total = diff_lines.len();
+        let ext = path.rsplit('.').next();
+        let effective_scroll = scroll.min(total.saturating_sub(1));
 
-    let border_color = if show_cursor { t.border_focused } else { t.border };
-    let block = Block::default()
-        .title(format!(" {} ", path))
-        .title_style(Style::default().fg(t.title))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .style(Style::default().bg(t.background));
+        let border_color = if focused { t.border_focused } else { t.border };
+        let block = Block::default()
+            .title(format!(" {} ", path))
+            .title_style(Style::default().fg(t.title))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .style(Style::default().bg(t.background));
 
-    let inner = block.inner(detail_chunks[0]);
-    frame.render_widget(block, detail_chunks[0]);
+        let inner = block.inner(detail_chunks[0]);
+        frame.render_widget(block, detail_chunks[0]);
 
-    if total == 0 {
-        frame.render_widget(
-            Paragraph::new("  No diff available for this file.")
-                .style(Style::default().fg(t.muted)),
-            inner,
-        );
-    } else {
-        let visible: Vec<Line> = diff_lines
-            .iter()
-            .enumerate()
-            .skip(effective_scroll)
-            .take(inner.height as usize)
-            .map(|(abs_idx, raw)| {
-                let is_selected = show_cursor && abs_idx == app.file_tree_line;
-                let line = colorize_diff_line_with_syntax(raw, ext, t);
-                if is_selected {
-                    Line::from(line.spans.into_iter().map(|s| {
-                        Span::styled(s.content, s.style.bg(t.selected_bg).fg(t.selected_fg))
-                    }).collect::<Vec<_>>())
-                } else {
-                    line
-                }
-            })
-            .collect();
-        frame.render_widget(
-            Paragraph::new(visible).style(Style::default().bg(t.background)),
-            inner,
-        );
-
-        // Vertical scrollbar
-        if total > inner.height as usize {
-            let max_s = total.saturating_sub(inner.height as usize);
-            let mut sb_state = ScrollbarState::new(max_s).position(effective_scroll.min(max_s));
-            frame.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(Some("▲"))
-                    .end_symbol(Some("▼"))
-                    .thumb_symbol("█")
-                    .track_symbol(Some("│")),
-                detail_chunks[0],
-                &mut sb_state,
-            );
-            // Line counter
-            let indicator = format!(" {}/{} ", effective_scroll + 1, total);
-            let iw = indicator.len() as u16;
-            let ind_area = Rect {
-                x: detail_chunks[0].right().saturating_sub(iw + 2),
-                y: detail_chunks[0].bottom().saturating_sub(1),
-                width: iw,
-                height: 1,
-            };
+        if total == 0 {
             frame.render_widget(
-                Paragraph::new(indicator)
-                    .style(Style::default().fg(t.muted).bg(t.background)),
-                ind_area,
+                Paragraph::new("  No diff available for this file.")
+                    .style(Style::default().fg(t.muted)),
+                inner,
             );
+        } else {
+            let visible: Vec<Line> = diff_lines
+                .iter()
+                .skip(effective_scroll)
+                .take(inner.height as usize)
+                .map(|raw| colorize_diff_line_with_syntax(raw, ext, t))
+                .collect();
+            frame.render_widget(
+                Paragraph::new(visible).style(Style::default().bg(t.background)),
+                inner,
+            );
+
+            if total > inner.height as usize {
+                let max_s = total.saturating_sub(inner.height as usize);
+                let mut sb_state = ScrollbarState::new(max_s).position(effective_scroll.min(max_s));
+                frame.render_stateful_widget(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .begin_symbol(Some("▲"))
+                        .end_symbol(Some("▼"))
+                        .thumb_symbol("█")
+                        .track_symbol(Some("│")),
+                    detail_chunks[0],
+                    &mut sb_state,
+                );
+                let indicator = format!(" {}/{} ", effective_scroll + 1, total);
+                let iw = indicator.len() as u16;
+                let ind_area = Rect {
+                    x: detail_chunks[0].right().saturating_sub(iw + 2),
+                    y: detail_chunks[0].bottom().saturating_sub(1),
+                    width: iw,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(indicator)
+                        .style(Style::default().fg(t.muted).bg(t.background)),
+                    ind_area,
+                );
+            }
         }
     }
 
-    // Comments section
+    // Comments section (hidden in fullscreen)
     if comment_height > 0 {
         let items: Vec<ListItem> = file_comments
             .iter()
@@ -309,6 +334,7 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 let agent = match &c.source {
                     CommentSource::Agent { agent_name, .. } => agent_name.as_str(),
                     CommentSource::Manual => "manual",
+                    CommentSource::GithubReview { user, .. } => user.as_str(),
                 };
                 let line1 = Line::from(vec![
                     status_icon,

@@ -236,6 +236,83 @@ impl GitHubApi {
         Ok(())
     }
 
+    /// Delete a top-level PR review. Only works on pending (unsubmitted) reviews;
+    /// submitted reviews must be dismissed instead.
+    pub async fn delete_review(&self, pr_number: u64, review_id: u64) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/reviews/{}",
+            self.client.base_url, self.client.owner, self.client.repo, pr_number, review_id
+        );
+        debug!("DELETE review {} on PR #{}", review_id, pr_number);
+        let response = self.client.client.delete(&url).send().await
+            .context("Failed to delete review")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("GitHub API error {}: {}", status, body);
+        }
+        Ok(())
+    }
+
+    /// Update the body of a top-level PR review.
+    pub async fn update_review(&self, pr_number: u64, review_id: u64, body: &str) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/reviews/{}",
+            self.client.base_url, self.client.owner, self.client.repo, pr_number, review_id
+        );
+        debug!("PUT review {} on PR #{}", review_id, pr_number);
+        let response = self.client.client
+            .put(&url)
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await
+            .context("Failed to update review")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("GitHub API error {}: {}", status, body);
+        }
+        Ok(())
+    }
+
+    /// Delete an existing inline review comment by its GitHub comment id.
+    pub async fn delete_review_comment(&self, comment_id: u64) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/comments/{}",
+            self.client.base_url, self.client.owner, self.client.repo, comment_id
+        );
+        debug!("DELETE review comment {}", comment_id);
+        let response = self.client.client.delete(&url).send().await
+            .context("Failed to delete review comment")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("GitHub API error {}: {}", status, body);
+        }
+        Ok(())
+    }
+
+    /// Update the body of an existing inline review comment.
+    pub async fn update_review_comment(&self, comment_id: u64, body: &str) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/comments/{}",
+            self.client.base_url, self.client.owner, self.client.repo, comment_id
+        );
+        debug!("PATCH review comment {}", comment_id);
+        let response = self.client.client
+            .patch(&url)
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await
+            .context("Failed to update review comment")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("GitHub API error {}: {}", status, body);
+        }
+        Ok(())
+    }
+
     /// Get the primary language of the repository.
     async fn get_repo_language(&self) -> Result<Option<String>> {
         let url = format!(

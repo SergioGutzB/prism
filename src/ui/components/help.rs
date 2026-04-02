@@ -213,6 +213,26 @@ fn help_for_screen(screen: &Screen) -> ScreenHelp {
             ],
         },
 
+        Screen::AgentWizard => ScreenHelp {
+            title: "Agent Wizard",
+            icon: "🪄",
+            overview: "Create a custom AI review agent. Fill in the ID (slug), Name, Icon, and the System Prompt that defines the agent's persona and instructions.",
+            actions: vec![
+                HelpEntry { key: "Tab",    desc: "Next field" },
+                HelpEntry { key: "i",      desc: "Enter INSERT mode (start typing)" },
+                HelpEntry { key: "Enter",  desc: "Save Agent (when in Normal mode)" },
+                HelpEntry { key: "Esc",    desc: "Back" },
+            ],
+            navigation: vec![
+                HelpEntry { key: "Tab",    desc: "Cycle through fields" },
+            ],
+            tips: vec![
+                "Agent ID must be unique and use snake_case (e.g., 'my_agent')",
+                "The System Prompt is the most important part — be specific about what the AI should look for",
+                "New agents are saved as Markdown files in ~/.config/prism/agents/",
+            ],
+        },
+
         Screen::Settings => ScreenHelp {
             title: "Settings",
             icon: "🛠️",

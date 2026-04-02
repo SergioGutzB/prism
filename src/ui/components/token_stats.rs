@@ -1,132 +1,120 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem};
+use crate::app::{App, ModelStats};
+use crate::ui::theme::Theme;
 
-use crate::app::App;
+fn range_label(range: u8) -> &'static str {
+    match range {
+        0 => "Last 7 Days",
+        1 => "Last 15 Days",
+        2 => "Last 30 Days",
+        _ => "All Time",
+    }
+}
 
-/// Render a token-statistics overlay centered over the screen.
+fn days_for_range(range: u8) -> Option<i64> {
+    match range {
+        0 => Some(7),
+        1 => Some(15),
+        2 => Some(30),
+        _ => None,
+    }
+}
+
+fn filtered_stats(stats: &ModelStats, days: Option<i64>) -> (u64, u64, u64) {
+    match days {
+        None => (stats.calls, stats.input_tokens, stats.output_tokens),
+        Some(d) => {
+            let cutoff = (chrono::Utc::now() - chrono::Duration::days(d))
+                .format("%Y-%m-%d")
+                .to_string();
+            stats.daily.iter()
+                .filter(|(day, _)| day.as_str() >= cutoff.as_str())
+                .fold((0u64, 0u64, 0u64), |acc, (_, ds)| {
+                    (acc.0 + ds.calls, acc.1 + ds.input_tokens, acc.2 + ds.output_tokens)
+                })
+        }
+    }
+}
+
 pub fn render_stats(frame: &mut Frame, app: &App) {
+    let t = Theme::current(&app.config.ui.theme);
     let area = frame.area();
-    let overlay = centered_rect(60, 50, area);
 
-    frame.render_widget(Clear, overlay);
+    let w = (area.width * 70 / 100).max(60).min(area.width);
+    let h = (area.height * 70 / 100).max(15).min(area.height);
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 2;
+    let popup_area = Rect { x, y, width: w, height: h };
 
-    let bg = Color::Rgb(10, 20, 10);
-    let accent = Color::Rgb(80, 220, 120);
-    let gold = Color::Rgb(255, 200, 50);
-    let muted = Color::Rgb(120, 140, 120);
-    let white = Color::Rgb(230, 230, 230);
+    frame.render_widget(Clear, popup_area);
 
-    let block = Block::default()
-        .title(" ◈ Token Statistics ")
-        .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(bg));
+    let days = days_for_range(app.stats_range);
+    let label = range_label(app.stats_range);
 
-    let inner = block.inner(overlay);
-    frame.render_widget(block, overlay);
-
-    let total_in = app.token_input_total;
-    let total_out = app.token_output_total;
-    let total_calls = app.token_calls_total;
-    let total_tokens = total_in + total_out;
-
-    // Cost estimate — Claude Sonnet pricing (approximate)
-    // Input: $3 / 1M tokens → $0.000003 per token
-    // Output: $15 / 1M tokens → $0.000015 per token
-    let cost_usd = (total_in as f64 * 3.0 + total_out as f64 * 15.0) / 1_000_000.0;
-
-    let avg_in = if total_calls > 0 { total_in / total_calls } else { 0 };
-    let avg_out = if total_calls > 0 { total_out / total_calls } else { 0 };
-
-    let lines: Vec<Line> = vec![
-        Line::from(Span::styled("  Session Summary", Style::default().fg(accent).add_modifier(Modifier::BOLD))),
-        Line::from(vec![
-            Span::styled("  ─────────────────────────────────────────────────  ", Style::default().fg(muted)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Agent calls      ", Style::default().fg(muted)),
-            Span::styled(format!("{}", total_calls), Style::default().fg(white).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Input tokens     ", Style::default().fg(muted)),
-            Span::styled(format_tokens(total_in), Style::default().fg(gold).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Output tokens    ", Style::default().fg(muted)),
-            Span::styled(format_tokens(total_out), Style::default().fg(gold).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Total tokens     ", Style::default().fg(muted)),
-            Span::styled(format_tokens(total_tokens), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("  Per-call Averages", Style::default().fg(accent).add_modifier(Modifier::BOLD))),
-        Line::from(vec![
-            Span::styled("  ─────────────────────────────────────────────────  ", Style::default().fg(muted)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Avg input        ", Style::default().fg(muted)),
-            Span::styled(format_tokens(avg_in), Style::default().fg(white)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Avg output       ", Style::default().fg(muted)),
-            Span::styled(format_tokens(avg_out), Style::default().fg(white)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("  Cost Estimate (Claude Sonnet pricing)", Style::default().fg(accent).add_modifier(Modifier::BOLD))),
-        Line::from(vec![
-            Span::styled("  ─────────────────────────────────────────────────  ", Style::default().fg(muted)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Estimated cost   ", Style::default().fg(muted)),
-            Span::styled(format!("~${:.4}", cost_usd), Style::default().fg(Color::Rgb(255, 160, 60)).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Input rate       ", Style::default().fg(muted)),
-            Span::styled("$3.00 / 1M tokens", Style::default().fg(muted)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Output rate      ", Style::default().fg(muted)),
-            Span::styled("$15.00 / 1M tokens", Style::default().fg(muted)),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Note: ", Style::default().fg(muted).add_modifier(Modifier::ITALIC)),
-            Span::styled("Token counts are estimates (chars / 4).", Style::default().fg(muted).add_modifier(Modifier::ITALIC)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  [Esc] / [T]  Close",
-            Style::default().fg(Color::Rgb(80, 100, 80)),
-        )),
+    let mut items = vec![
+        ListItem::new(Line::from(vec![
+            Span::styled(" Range: ", Style::default().fg(t.muted)),
+            Span::styled(label, Style::default().fg(t.warning).add_modifier(Modifier::BOLD)),
+            Span::styled("   [← →] cycle range", Style::default().fg(t.muted)),
+        ])),
+        ListItem::new(Line::from(Span::raw(""))),
     ];
 
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .style(Style::default().bg(bg));
-    frame.render_widget(para, inner);
-}
+    let mut total_calls = 0u64;
+    let mut total_in = 0u64;
+    let mut total_out = 0u64;
 
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.2}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        format!("{}", n)
-    }
-}
+    // Sort models for stable display
+    let mut models: Vec<_> = app.model_stats.iter().collect();
+    models.sort_by_key(|(k, _)| k.as_str());
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_width = r.width * percent_x / 100;
-    let popup_height = r.height * percent_y / 100;
-    let x = r.x + (r.width.saturating_sub(popup_width)) / 2;
-    let y = r.y + (r.height.saturating_sub(popup_height)) / 2;
-    Rect {
-        x,
-        y,
-        width: popup_width.max(1),
-        height: popup_height.max(1),
+    for (model, stats) in &models {
+        let (calls, input_tokens, output_tokens) = filtered_stats(stats, days);
+        total_calls += calls;
+        total_in += input_tokens;
+        total_out += output_tokens;
+
+        let since = stats.start_date
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!(" 🤖 {:20}", model), Style::default().fg(t.title).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" calls:{:5} | in:{:9} | out:{:9}", calls, input_tokens, output_tokens),
+                Style::default().fg(t.foreground),
+            ),
+            Span::styled(format!(" (since {})", since), Style::default().fg(t.muted)),
+        ])));
     }
+
+    items.push(ListItem::new(Line::from(Span::styled(
+        " ".repeat(w as usize),
+        Style::default().add_modifier(Modifier::UNDERLINED).fg(t.border),
+    ))));
+
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(" TOTALS:             ", Style::default().fg(t.muted)),
+        Span::styled(
+            format!(" calls:{:5} | in:{:9} | out:{:9}", total_calls, total_in, total_out),
+            Style::default().fg(t.suggestion).add_modifier(Modifier::BOLD),
+        ),
+    ])));
+
+    items.push(ListItem::new(Line::from(Span::raw(""))));
+    items.push(ListItem::new(Line::from(
+        Span::styled(" [← →] Change Range   [Esc] or [T] Close", Style::default().fg(t.muted)),
+    )));
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(" LLM Usage Statistics ")
+            .title_style(Style::default().fg(t.title).add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .style(Style::default().bg(t.background)),
+    );
+
+    frame.render_widget(list, popup_area);
 }

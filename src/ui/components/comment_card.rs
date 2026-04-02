@@ -32,6 +32,7 @@ pub fn render(
             format!("{} {}", agent_icon, agent_name)
         }
         CommentSource::Manual => "✍ Manual".to_string(),
+        CommentSource::GithubReview { user, state, .. } => format!("💬 {} ({})", user, state),
     };
 
     let title = format!(

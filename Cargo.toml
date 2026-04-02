@@ -32,6 +32,8 @@ textwrap = "0.16"
 async-trait = "0.1"
 indexmap = "2"
 serde_yaml = "0.9.34"
+tui-textarea = "0.7.0"
+toml_edit = "0.25.8"
 
 [dev-dependencies]
 mockito = "1"

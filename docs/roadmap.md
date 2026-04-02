@@ -3,8 +3,8 @@
 Prism is an evolving project. Here are the planned features and areas for improvement.
 
 ## 🚀 Future Features (Planned)
-- [ ] **Custom Agent Creation Wizard:** A UI-driven way to add new reviewer agents without editing TOML files.
-- [ ] **Semantic Diff Analysis:** Instead of simple text diffs, use an AST-aware diff to provide more accurate context to the AI.
+- [x] **Custom Agent Creation Wizard:** A UI-driven way to add new reviewer agents without editing TOML files.
+- [x] **Semantic Diff Analysis:** Instead of simple text diffs, use an AST-aware diff to provide more accurate context to the AI.
 - [ ] **PR Thread Integration:** Ability to see and respond to existing GitHub comment threads directly from Prism.
 - [ ] **Multi-PR Batching:** Select multiple PRs to review at once in the background.
 - [ ] **Auto-Correct (The Fixer Agent):** Let the AI automatically generate a commit with the suggested fixes.

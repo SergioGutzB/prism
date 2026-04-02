@@ -65,6 +65,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         ("[z]", "Full diff")
     };
 
+    let split_hint = if app.diff_fullscreen {
+        if app.diff_split_mode { ("[Z]", "Unified") } else { ("[Z]", "Split") }
+    } else {
+        ("[Z]", "Split")
+    };
+
     let review_count = app.draft.as_ref().map(|d| d.comments.len()).unwrap_or(0);
     let reviews_label: String = if review_count > 0 {
         format!("Reviews({})", review_count)
@@ -86,6 +92,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             ("[Tab]", "Pane"),
             ("[jk]", "Scroll"),
             fullscreen_hint,
+            split_hint,
             ("[?]", "Help"),
         ],
         &t,
@@ -182,5 +189,9 @@ fn render_description(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
 
 fn render_diff_panel(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let focused = app.selected_pane == 1;
-    diff_view::render(frame, app, area, t, focused);
+    if app.diff_split_mode {
+        diff_view::render_split(frame, app, area, t, focused);
+    } else {
+        diff_view::render(frame, app, area, t, focused);
+    }
 }

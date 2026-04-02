@@ -12,7 +12,7 @@ mod ui;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, debug, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::app::{App, PendingPublish, PopupKind, PopupState, Screen};
@@ -21,15 +21,11 @@ use crate::tui::keybindings::{map_key, Action, InputMode, KeySequence};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load .env if present
     let _ = dotenvy::dotenv();
-
-    // Init tracing to a file (not stdout — stdout is the TUI)
     let _guard = init_tracing();
 
     info!("prism v{}", env!("CARGO_PKG_VERSION"));
 
-    // Load configuration
     let config = match config::AppConfig::load() {
         Ok(c) => c,
         Err(e) => {
@@ -38,63 +34,44 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Load agent definitions
     let agents = match agents::loader::load_agents(&config) {
-        Ok(a) => {
-            info!("Loaded {} agents", a.len());
-            a
-        }
+        Ok(a) => a,
         Err(e) => {
             eprintln!("Warning: failed to load agents: {e}");
             vec![]
         }
     };
 
-    // Build initial app state
     let mut app = App::new(config.clone(), agents);
+    app.model_stats = config::AppConfig::load_stats();
 
-    // Setup terminal
     let mut terminal = tui::terminal::init()?;
-
-    // Event channel
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
-
-    // Spawn crossterm reader
     spawn_event_reader(event_tx.clone());
 
-    // If GitHub is configured, kick off PR list loading in background
     if config.is_github_configured() {
         let tx = event_tx.clone();
         let cfg = config.clone();
         tokio::spawn(async move {
             match load_pr_list(&cfg).await {
-                Ok(prs) => {
-                    let _ = tx.send(AppEvent::PrListLoaded(prs));
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to load PRs: {e}")));
-                }
+                Ok(prs) => { let _ = tx.send(AppEvent::PrListLoaded(prs)); }
+                Err(e) => { let _ = tx.send(AppEvent::Error(format!("Failed to load PRs: {e}"))); }
             }
         });
 
-        // Fetch current authenticated user
-        {
-            let tx = event_tx.clone();
-            let cfg = config.clone();
-            tokio::spawn(async move {
-                if let Ok(api) = make_github_api(&cfg) {
-                    if let Ok(login) = api.get_current_user().await {
-                        let _ = tx.send(AppEvent::UserLoaded(login));
-                    }
+        let tx = event_tx.clone();
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            if let Ok(api) = make_github_api(&cfg).await {
+                if let Ok(login) = api.get_current_user().await {
+                    let _ = tx.send(AppEvent::UserLoaded(login));
                 }
-            });
-        }
+            }
+        });
     } else {
-        // Try to auto-detect credentials from gh CLI
         let gh_token = config::AppConfig::gh_token();
         if let Some(token) = gh_token {
-            let (owner, repo) = config::AppConfig::gh_current_repo()
-                .unwrap_or_default();
+            let (owner, repo) = config::AppConfig::gh_current_repo().unwrap_or_default();
             app.setup_gh_token = token;
             app.setup_owner = owner;
             app.setup_repo = repo;
@@ -103,1212 +80,693 @@ async fn main() -> Result<()> {
         app.pr_list_loading = false;
     }
 
-    // ── Main event loop ────────────────────────────────────────────────────
-    // Render at a fixed 16ms (~60fps) independently of incoming events.
-    // Events are processed as soon as they arrive via tokio::select!.
     let mut render_ticker = tokio::time::interval(std::time::Duration::from_millis(16));
     render_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
-            biased; // prefer events over render ticks to stay responsive
-
-            // ── Incoming async events ──────────────────────────────────────
+            biased;
             maybe_event = event_rx.recv() => {
-                let event = match maybe_event {
-                    Some(e) => e,
-                    None => break,
-                };
+                let event = match maybe_event { Some(e) => e, None => break };
                 match event {
                     AppEvent::Key(key_event) => {
-                        if app.input_mode == InputMode::Normal {
+                        // Bypass key sequence detector when an editor is in insert mode.
+                        // Check editor.is_insert_mode directly to handle the very first key after 'i',
+                        // since app.input_mode might lag one event behind the editor's internal state.
+                        let bypass_seq_detector = app.input_mode == InputMode::Insert
+                            || match app.screen {
+                                Screen::ReviewCompose => app.compose_editor.is_insert_mode,
+                                Screen::AgentWizard
+                                    if app.wizard_field == crate::app::AgentWizardField::SystemPrompt =>
+                                {
+                                    app.wizard_prompt_editor.is_insert_mode
+                                }
+                                // Simple wizard fields always accept text — bypass seq detector
+                                Screen::AgentWizard => true,
+                                _ => false,
+                            };
+
+                        if !bypass_seq_detector {
                             if let Some(seq) = app.key_detector.feed(&key_event) {
                                 handle_sequence(&mut app, seq);
                                 if app.should_quit { break; }
                                 continue;
                             }
                         }
-                        if let Some(action) = map_key(&key_event, &app.input_mode) {
-                            handle_action(&mut app, action, &event_tx, &config).await;
+
+                        let captured = match app.screen {
+                            Screen::ReviewCompose => {
+                                let handled = app.compose_editor.handle_key(key_event);
+                                app.input_mode = if app.compose_editor.is_insert_mode {
+                                    InputMode::Insert
+                                } else {
+                                    InputMode::Normal
+                                };
+                                handled
+                            }
+                            // Simple wizard text fields: always accept Char/Backspace directly,
+                            // no Insert mode ceremony needed.
+                            Screen::AgentWizard
+                                if app.wizard_field != crate::app::AgentWizardField::SystemPrompt =>
+                            {
+                                use crossterm::event::{KeyCode, KeyModifiers};
+                                match key_event.code {
+                                    KeyCode::Char(c)
+                                        if !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        match app.wizard_field {
+                                            crate::app::AgentWizardField::Id => { app.wizard_id.push(c); }
+                                            crate::app::AgentWizardField::Name => { app.wizard_name.push(c); }
+                                            crate::app::AgentWizardField::Icon => {
+                                                app.wizard_icon.clear();
+                                                app.wizard_icon.push(c);
+                                            }
+                                            crate::app::AgentWizardField::SystemPrompt => {}
+                                        }
+                                        true
+                                    }
+                                    KeyCode::Backspace => {
+                                        match app.wizard_field {
+                                            crate::app::AgentWizardField::Id => { app.wizard_id.pop(); }
+                                            crate::app::AgentWizardField::Name => { app.wizard_name.pop(); }
+                                            crate::app::AgentWizardField::Icon => { app.wizard_icon.pop(); }
+                                            crate::app::AgentWizardField::SystemPrompt => {}
+                                        }
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            }
+                            Screen::AgentWizard
+                                if app.wizard_field == crate::app::AgentWizardField::SystemPrompt =>
+                            {
+                                let handled = app.wizard_prompt_editor.handle_key(key_event);
+                                app.input_mode = if app.wizard_prompt_editor.is_insert_mode {
+                                    InputMode::Insert
+                                } else {
+                                    InputMode::Normal
+                                };
+                                handled
+                            }
+                            _ => false,
+                        };
+
+                        if !captured {
+                            if let Some(action) = map_key(&key_event, &app.input_mode) {
+                                handle_action(&mut app, action, &event_tx, &config).await;
+                            }
                         }
                         if app.should_quit { break; }
                     }
-
-                    AppEvent::PrListLoaded(prs) => {
-                        info!("PR list loaded: {} PRs", prs.len());
-                        // Prune caches for closed/merged PRs and stale entries (background)
-                        {
-                            let open_numbers: Vec<u64> = prs.iter().map(|p| p.number).collect();
-                            let repo_slug = format!(
-                                "{}/{}",
-                                config.github.owner, config.github.repo
-                            );
-                            tokio::spawn(async move {
-                                crate::review::cache::prune_closed(&repo_slug, &open_numbers);
-                                crate::review::cache::prune_stale(&repo_slug, 30);
-                            });
-                        }
-                        app.pr_list = prs;
-                        app.pr_list_loading = false;
-                        if app.pr_list.is_empty() {
-                            app.set_status("No open PRs found.");
-                        }
-                    }
-
-                    AppEvent::PrLoaded(pr) => {
-                        info!("PR #{} loaded", pr.number);
-                        app.current_pr = Some(*pr);
-                        app.pr_loading = false;
-                    }
-
+                    AppEvent::PrListLoaded(prs) => { app.pr_list = prs; app.pr_list_loading = false; }
+                    AppEvent::PrLoaded(pr) => { app.current_pr = Some(*pr); app.pr_loading = false; }
                     AppEvent::DiffLoaded(diff) => {
-                        info!("Diff loaded ({} chars)", diff.len());
-                        // Pre-split lines so render only colorizes the visible slice
-                        app.diff_lines_cache = Some(
-                            diff.lines().map(str::to_string).collect()
-                        );
-                        // Precompute file extension for each diff line (used for syntax highlighting)
-                        let diff_line_ext = {
-                            let mut current_ext: Option<String> = None;
-                            diff.lines().map(|line| {
-                                if line.starts_with("diff --git ") {
-                                    current_ext = line.split(" b/").nth(1)
-                                        .and_then(|p| p.rsplit('.').next())
-                                        .map(|s| s.to_string());
-                                }
-                                current_ext.clone()
-                            }).collect()
-                        };
-                        app.diff_line_ext = diff_line_ext;
+                        app.diff_lines_cache = Some(diff.lines().map(str::to_string).collect());
                         app.current_diff = Some(diff);
                         app.diff_loading = false;
+                        if let (Some(draft), Some(d)) = (&mut app.draft, &app.current_diff.clone()) {
+                            populate_checklist_from_diff(draft, d);
+                        }
                     }
-
-                    AppEvent::TicketLoaded(ticket) => {
-                        info!("Ticket loaded: {}", ticket.is_some());
-                        app.current_ticket = ticket;
-                    }
-
-                    AppEvent::AgentUpdate(update) => {
-                        handle_agent_update(&mut app, update);
-                    }
-
-                    AppEvent::Error(msg) => {
-                        app.pr_list_loading = false;
-                        app.pr_loading = false;
-                        app.diff_loading = false;
-                        app.show_error(msg);
-                    }
-
-                    AppEvent::PublishDone => {
-                        app.show_info("Published", "Review submitted to GitHub successfully.");
-                        app.draft = None;
-                        app.screen_stack.clear();
-                        app.screen = Screen::PrList;
-                    }
-
-                    AppEvent::PublishFailed(msg) => {
-                        let display = if msg.contains("request changes on your own pull request") {
-                            "Cannot request changes on your own PR. Change review type to 'Comment' or 'Approve'.".to_string()
-                        } else {
-                            format!("Publish failed: {}", msg)
-                        };
-                        app.show_error(display);
-                    }
-
-                    AppEvent::UserLoaded(login) => {
-                        app.github_user = Some(login);
-                    }
-
                     AppEvent::ConfigReloaded(cfg, agents) => {
-                        info!("Configuration reloaded from disk");
-                        let old_github = app.config.github.clone();
-                        app.config = cfg.clone();
+                        app.config = cfg;
                         app.agents = agents;
-                        app.set_status("Configuration reloaded.");
-                        
-                        // If GitHub credentials changed, reload PR list
-                        if cfg.github.token != old_github.token || 
-                           cfg.github.owner != old_github.owner || 
-                           cfg.github.repo != old_github.repo 
-                        {
-                            if cfg.is_github_configured() {
-                                app.pr_list_loading = true;
-                                app.pr_list.clear();
-                                let tx = event_tx.clone();
-                                let c = cfg.clone();
-                                tokio::spawn(async move {
-                                    match load_pr_list(&c).await {
-                                        Ok(prs) => { let _ = tx.send(AppEvent::PrListLoaded(prs)); }
-                                        Err(e) => { let _ = tx.send(AppEvent::Error(format!("Failed to reload PRs: {e}"))); }
-                                    }
-                                });
-                            }
-                        }
+                        app.set_status("Config reloaded.");
                     }
-
+                    AppEvent::Error(msg) => { app.show_error(msg); }
+                    AppEvent::AgentUpdate(update) => { handle_agent_update(&mut app, update); }
+                    AppEvent::UserLoaded(login) => { app.github_user = Some(login); }
                     AppEvent::ReviewsLoaded(reviews, comments) => {
-                        use review::models::{CommentSource, CommentStatus, GeneratedComment, Severity};
-                        let draft = app.draft.get_or_insert_with(|| {
+                        if reviews.is_empty() && comments.is_empty() { /* nothing to merge */ }
+                        else {
                             let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
-                            review::models::ReviewDraft::new(pr_num, review::models::ReviewMode::ManualOnly)
-                        });
-
-                        // Add existing reviews as comments (only non-empty body reviews)
-                        for review in &reviews {
-                            if review.body.trim().is_empty() { continue; }
-                            let severity = match review.state {
-                                github::models::GhReviewState::ChangesRequested => Severity::Warning,
-                                github::models::GhReviewState::Approved => Severity::Praise,
-                                _ => Severity::Suggestion,
-                            };
-                            let mut comment = GeneratedComment::new(
-                                CommentSource::Agent {
-                                    agent_id: format!("gh_review_{}", review.id),
-                                    agent_name: format!("@{}", review.user.login),
-                                    agent_icon: "\u{1F50D}".to_string(),
-                                },
-                                review.body.clone(),
-                                severity,
-                                None,
-                                None,
-                            );
-                            comment.status = CommentStatus::Approved;
-                            let already = draft.comments.iter().any(|c| {
-                                if let CommentSource::Agent { agent_id, .. } = &c.source {
-                                    agent_id == &format!("gh_review_{}", review.id)
-                                } else { false }
-                            });
-                            if !already { draft.comments.push(comment); }
-                        }
-
-                        // Add existing inline comments
-                        for ic in &comments {
-                            let mut comment = GeneratedComment::new(
-                                CommentSource::Agent {
-                                    agent_id: format!("gh_comment_{}", ic.id),
-                                    agent_name: format!("@{}", ic.user.login),
-                                    agent_icon: "\u{1F4AC}".to_string(),
-                                },
-                                ic.body.clone(),
-                                Severity::Suggestion,
-                                Some(ic.path.clone()),
-                                ic.line,
-                            );
-                            comment.status = CommentStatus::Approved;
-                            let already = draft.comments.iter().any(|c| {
-                                if let CommentSource::Agent { agent_id, .. } = &c.source {
-                                    agent_id == &format!("gh_comment_{}", ic.id)
-                                } else { false }
-                            });
-                            if !already { draft.comments.push(comment); }
-                        }
-
-                        let total = reviews.iter().filter(|r| !r.body.trim().is_empty()).count() + comments.len();
-                        if total > 0 {
-                            app.set_status(format!("{} existing review(s) loaded from GitHub — press [v] to view", total));
-                        }
-                    }
-
-                    AppEvent::SetupSaved(token, owner, repo) => {
-                        app.setup_saving = false;
-                        app.config.github.token = token;
-                        app.config.github.owner = owner.clone();
-                        app.config.github.repo = repo.clone();
-                        app.screen = Screen::PrList;
-                        app.pr_list_loading = true;
-                        let tx = event_tx.clone();
-                        let cfg = app.config.clone();
-                        tokio::spawn(async move {
-                            match load_pr_list(&cfg).await {
-                                Ok(prs) => { let _ = tx.send(AppEvent::PrListLoaded(prs)); }
-                                Err(e) => { let _ = tx.send(AppEvent::Error(format!("Failed to load PRs: {e}"))); }
+                            if pr_num > 0 {
+                                let draft = app.draft.get_or_insert_with(|| {
+                                    review::models::ReviewDraft::new(pr_num, review::models::ReviewMode::ManualOnly)
+                                });
+                                draft.merge_github_reviews(reviews, comments);
+                                // populate file checklist if diff is available
+                                if let Some(diff) = &app.current_diff.clone() {
+                                    populate_checklist_from_diff(draft, diff);
+                                }
                             }
-                        });
-                    }
-
-                    AppEvent::SetupFailed(msg) => {
-                        app.setup_saving = false;
-                        app.show_error(format!("Could not save config: {}", msg));
-                    }
-
-                    AppEvent::QuickCommentDone => {
-                        app.show_info("Published", "Comment posted to GitHub successfully.");
-                        app.compose_text.clear();
-                        app.compose_cursor = 0;
-                        app.compose_quick_mode = false;
-                        app.navigate_back();
-                    }
-
-                    AppEvent::QuickCommentFailed(msg) => {
-                        app.show_error(format!("Failed to post comment: {}", msg));
-                    }
-
-                    AppEvent::FixTaskChunk(idx, chunk) => {
-                        if let Some(task) = app.fix_tasks.get_mut(idx) {
-                            task.output.push_str(&chunk);
                         }
-                        // Auto-follow the running task and scroll its output to bottom
-                        app.fix_task_selected = idx;
-                        let line_count = app.fix_tasks.get(idx)
-                            .map(|t| t.output.lines().count())
-                            .unwrap_or(0);
-                        app.claude_output_scroll = line_count.saturating_sub(1);
                     }
-
-                    AppEvent::FixTaskDone(idx) => {
-                        if let Some(task) = app.fix_tasks.get_mut(idx) {
-                            task.status = app::FixTaskStatus::Done;
+                    AppEvent::PublishDone => {
+                        app.set_status("Review published successfully!");
+                        app.navigate_to(Screen::PrList);
+                    }
+                    AppEvent::PublishFailed(e) => { app.show_error(format!("Publish failed: {e}")); }
+                    AppEvent::CommentDeleted(_id) => {
+                        // Comment was already removed locally on confirm; just show status
+                        app.set_status("Comment deleted from GitHub.");
+                    }
+                    AppEvent::CommentUpdated(id, new_body) => {
+                        if let Some(draft) = &mut app.draft {
+                            if let Some(c) = draft.comments.iter_mut().find(|c| c.id == id) {
+                                c.body = new_body;
+                                c.edited_body = None;
+                            }
                         }
-                        advance_fix_tasks(&mut app, &event_tx, &config);
+                        app.set_status("Comment updated on GitHub.");
                     }
-
-                    AppEvent::FixTaskFailed(idx, msg) => {
-                        if let Some(task) = app.fix_tasks.get_mut(idx) {
-                            task.status = app::FixTaskStatus::Failed(msg);
-                        }
-                        // Continue with the next pending task even if one fails
-                        advance_fix_tasks(&mut app, &event_tx, &config);
-                    }
+                    _ => {}
                 }
             }
-
-            // ── Render tick (60fps) ────────────────────────────────────────
+            agent_update = async {
+                if let Some(rx) = &mut app.agent_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending::<Option<agents::orchestrator::AgentUpdate>>().await
+                }
+            } => {
+                match agent_update {
+                    Some(update) => handle_agent_update(&mut app, update),
+                    None => { app.agent_rx = None; } // channel closed
+                }
+            }
             _ = render_ticker.tick() => {
                 app.tick = app.tick.wrapping_add(1);
-
-                // Drain agent updates (non-blocking)
-                let agent_updates: Vec<_> = if let Some(rx) = &mut app.agent_rx {
-                    let mut updates = Vec::new();
-                    while let Ok(u) = rx.try_recv() { updates.push(u); }
-                    updates
-                } else {
-                    Vec::new()
-                };
-                for update in agent_updates {
-                    handle_agent_update(&mut app, update);
-                }
-
                 if let Ok(size) = terminal.size() {
-                    // Approximate diff viewport: full height minus header(3) + keybind(3) + borders(2)
                     app.diff_viewport_height = size.height.saturating_sub(8) as usize;
                 }
-
                 terminal.draw(|frame| ui::render(frame, &app))?;
             }
         }
     }
 
-    // Restore terminal
     tui::terminal::restore(&mut terminal)?;
+    config::AppConfig::save_stats(&app.model_stats);
     Ok(())
 }
 
-// ── Event handlers ─────────────────────────────────────────────────────────
-
-fn handle_sequence(app: &mut App, seq: KeySequence) {
-    match seq {
-        KeySequence::GoTop => {
-            app.pr_list_selected = 0;
-            app.diff_scroll = 0;
+async fn handle_action(app: &mut App, action: Action, event_tx: &mpsc::UnboundedSender<AppEvent>, config: &config::AppConfig) {
+    // ── 1. Overlays Hierarchy (Help/Stats) ──────────────────────────────────
+    if app.show_help {
+        if action == Action::Back || action == Action::Help {
+            app.show_help = false;
         }
-        KeySequence::Delete => {
-            // Delete current item in DoubleCheck (reject it)
-            if app.screen == Screen::DoubleCheck {
-                if let Some(draft) = &mut app.draft {
-                    if let Some(comment) = draft.comments.get_mut(app.double_check_selected) {
-                        comment.status = crate::review::models::CommentStatus::Rejected;
-                    }
-                }
-            }
-        }
-        KeySequence::ColonQuit => {
-            app.popup = Some(PopupState {
-                title: "Quit Prism".to_string(),
-                message: "Are you sure you want to quit?".to_string(),
-                kind: PopupKind::ConfirmQuit,
-            });
-        }
-        KeySequence::ColonWrite => {
-            // Save / confirm depending on screen
-            app.set_status("Saved.");
-        }
+        return;
     }
-}
-
-async fn handle_action(
-    app: &mut App,
-    action: Action,
-    event_tx: &mpsc::UnboundedSender<AppEvent>,
-    config: &config::AppConfig,
-) {
-    // If a popup is open, only allow closing it
-    if app.popup.is_some() {
+    if app.show_stats {
         match action {
-            Action::Confirm => {
-                let kind = app.popup.as_ref().map(|p| p.kind.clone());
-                let pending = app.pending_publish.take();
-                app.dismiss_popup();
-                match kind {
-                    Some(PopupKind::ConfirmQuit) => {
-                        app.should_quit = true;
-                    }
-                    Some(PopupKind::ConfirmPublish) => {
-                        match pending {
-                            Some(PendingPublish::QuickComment { text }) => {
-                                publish_quick_comment(app, event_tx, config, text).await;
-                            }
-                            Some(PendingPublish::FullReview) => {
-                                publish_review(app, event_tx, config).await;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some(PopupKind::ConfirmRestart) => {
-                        if matches!(pending, Some(PendingPublish::RestartReview)) {
-                            // Clear draft and re-run all agents from scratch
-                            app.draft = None;
-                            app.agent_statuses.clear();
-                            start_agent_runner(app, config);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Action::Quit | Action::Back | Action::ExitInsert => {
-                let kind = app.popup.as_ref().map(|p| p.kind.clone());
-                let pending = app.pending_publish.take();
-                app.dismiss_popup();
-                // On Esc from ConfirmRestart: navigate to DoubleCheck (resume)
-                if kind == Some(PopupKind::ConfirmRestart) {
-                    if matches!(pending, Some(PendingPublish::RestartReview)) {
-                        if app.draft.as_ref().map(|d| !d.comments.is_empty()).unwrap_or(false) {
-                            app.navigate_to(Screen::DoubleCheck);
-                        }
-                    }
-                }
+            Action::Back | Action::ShowStats => { app.show_stats = false; }
+            Action::NavRight | Action::NavDown => { app.stats_range = (app.stats_range + 1) % 4; }
+            Action::NavLeft | Action::NavUp => {
+                app.stats_range = if app.stats_range == 0 { 3 } else { app.stats_range - 1 };
             }
             _ => {}
         }
         return;
     }
 
-    // Setup wizard intercepts all input
-    if app.screen == Screen::Setup {
-        handle_setup_action(app, action, event_tx).await;
+    // ── 2. Popups (Blocking) ────────────────────────────────────────────────
+    if let Some(popup) = &app.popup {
+        let kind = popup.kind.clone();
+
+        // ConfirmCancelAgents has three options
+        if kind == PopupKind::ConfirmCancelAgents {
+            match action {
+                Action::Back => {
+                    // [Esc] — stay on AgentRunner, dismiss modal
+                    app.dismiss_popup();
+                }
+                Action::Confirm => {
+                    // [Enter] — cancel jobs and go back
+                    app.dismiss_popup();
+                    if let Some(abort) = app.agent_abort.take() { abort.abort(); }
+                    app.agent_rx = None;
+                    app.navigate_back();
+                }
+                Action::ManualComment => {
+                    // [c] — go back but let jobs continue; results will appear when done
+                    app.dismiss_popup();
+                    app.navigate_back();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if action == Action::Back {
+            app.dismiss_popup();
+            return;
+        }
+        if action == Action::Confirm {
+            let pending = app.pending_publish.take();
+            let delete_id = app.pending_delete_comment.take();
+            app.dismiss_popup();
+            match kind {
+                PopupKind::ConfirmQuit => { app.should_quit = true; }
+                PopupKind::ConfirmPublish => {
+                    if let Some(crate::app::PendingPublish::FullReview) = pending {
+                        publish_review(app, event_tx, config).await;
+                    }
+                }
+                PopupKind::ConfirmRestart => {
+                    app.draft = None;
+                    start_agent_runner(app, config);
+                }
+                PopupKind::ConfirmDeleteComment => {
+                    if let Some(local_id) = delete_id {
+                        use review::models::CommentSource;
+                        // Look up github_id + source type before removing
+                        let (github_id, is_review_summary) = app.draft.as_ref()
+                            .and_then(|d| d.comments.iter().find(|c| c.id == local_id))
+                            .map(|c| (c.github_id, matches!(c.source, CommentSource::GithubReview { .. })))
+                            .unwrap_or((None, false));
+                        let pr_num = app.current_pr.as_ref().map(|p| p.number);
+                        // Remove from local draft immediately
+                        if let Some(draft) = &mut app.draft {
+                            draft.comments.retain(|c| c.id != local_id);
+                            let total = draft.comments.len();
+                            if app.double_check_selected >= total && total > 0 {
+                                app.double_check_selected = total - 1;
+                            }
+                        }
+                        // Spawn remote deletion if this came from GitHub
+                        if let Some(gh_id) = github_id {
+                            let tx = event_tx.clone();
+                            let cfg = config.clone();
+                            tokio::spawn(async move {
+                                if let Ok(api) = make_github_api(&cfg).await {
+                                    let result = if is_review_summary {
+                                        api.delete_review(pr_num.unwrap_or(0), gh_id).await
+                                    } else {
+                                        api.delete_review_comment(gh_id).await
+                                    };
+                                    match result {
+                                        Ok(_) => { let _ = tx.send(AppEvent::CommentDeleted(local_id)); }
+                                        Err(e) => { let _ = tx.send(AppEvent::Error(format!("Delete failed: {e}"))); }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         return;
     }
 
+    // ── 3. Main Action Logic ────────────────────────────────────────────────
     match action {
         Action::Quit => {
             app.popup = Some(PopupState {
-                title: "Quit Prism".to_string(),
+                title: "Quit".to_string(),
                 message: "Are you sure you want to quit?".to_string(),
                 kind: PopupKind::ConfirmQuit,
             });
         }
-
         Action::Back => {
-            // Dismiss overlays first
-            if app.show_help {
-                app.show_help = false;
-                return;
-            }
-            if app.show_stats {
-                app.show_stats = false;
-                return;
-            }
             if app.input_mode == InputMode::Insert {
                 app.input_mode = InputMode::Normal;
-                return;
+            } else if app.screen == Screen::AgentRunner && app.agent_abort.is_some() {
+                // Jobs are still running — ask what to do
+                app.popup = Some(PopupState {
+                    title: "Review in progress".to_string(),
+                    message: "AI agents are still running.\n\nCancel the jobs, or go back and let them finish in the background?".to_string(),
+                    kind: PopupKind::ConfirmCancelAgents,
+                });
+            } else {
+                if app.screen == Screen::PrDetail {
+                    app.diff_fullscreen = false;
+                    app.diff_split_mode = false;
+                    app.diff_scroll = 0;
+                } else if app.screen == Screen::FileTree {
+                    if app.file_tree_fullscreen {
+                        // First Esc exits fullscreen, second goes back
+                        app.file_tree_fullscreen = false;
+                        app.file_tree_split = false;
+                        app.file_tree_scroll = 0;
+                        return;
+                    }
+                }
+                app.navigate_back();
             }
-            app.navigate_back();
         }
 
-        Action::ExitInsert => {
-            app.input_mode = InputMode::Normal;
-        }
-
-        Action::EnterInsert => {
-            if matches!(app.screen, Screen::ReviewCompose) {
-                app.input_mode = InputMode::Insert;
-            }
-        }
-
-        Action::NavDown => {
-            match app.screen {
-                Screen::PrList => app.nav_down(),
-                Screen::FileTree => {
-                    if app.file_tree_pane == 1 {
-                        // Move line selection in detail panel
-                        let file_count = app.draft.as_ref()
-                            .and_then(|d| d.file_checklist.keys().nth(app.pr_list_selected))
-                            .map(|path| count_file_diff_lines(app, path))
-                            .unwrap_or(0);
-                        if app.file_tree_line + 1 < file_count {
-                            app.file_tree_line += 1;
-                        }
-                    } else {
-                        let len = app.draft.as_ref().map(|d| d.file_checklist.len()).unwrap_or(0);
-                        if app.pr_list_selected + 1 < len {
-                            app.pr_list_selected += 1;
-                            app.file_tree_scroll = 0;
-                            app.file_tree_line = 0;
-                        }
-                    }
-                }
-                Screen::DoubleCheck => {
-                    if app.double_check_pane == 1 {
-                        // detail panel: scroll down
-                        app.double_check_detail_scroll = app.double_check_detail_scroll.saturating_add(1);
-                    } else {
-                        let len = app.draft.as_ref().map(|d| d.comments.len()).unwrap_or(0);
-                        if app.double_check_selected + 1 < len {
-                            app.double_check_selected += 1;
-                            app.double_check_detail_scroll = 0;
-                        }
-                    }
-                }
-                Screen::AgentConfig => {
-                    if app.agent_config_selected + 1 < app.agents.len() {
-                        app.agent_config_selected += 1;
-                    }
-                }
-                Screen::PrDetail => {
-                    match app.selected_pane {
-                        0 => app.description_scroll = app.description_scroll.saturating_add(3),
-                        _ => {
-                            let max_lines = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
-                            let max_scroll = max_lines.saturating_sub(app.diff_viewport_height);
-                            app.diff_scroll = (app.diff_scroll + 3).min(max_scroll);
-                        }
-                    }
-                }
-                Screen::SummaryPreview => {
-                    if app.summary_pane == 0 {
-                        app.summary_body_scroll = app.summary_body_scroll.saturating_add(3);
-                    } else {
-                        app.summary_comments_scroll = app.summary_comments_scroll.saturating_add(1);
-                    }
-                }
-                Screen::ClaudeCodeOutput => {
-                    // j scrolls the output of the selected task OR navigates down the task list
-                    let task_count = app.fix_tasks.len();
-                    if task_count > 0 && app.fix_task_selected < task_count - 1 {
-                        app.fix_task_selected += 1;
-                        app.claude_output_scroll = 0;
-                    }
-                }
+        // Navigation
+        Action::NavDown => match app.screen {
+            Screen::PrList => app.nav_down(),
+            Screen::PrDetail => match app.selected_pane {
+                0 => app.description_scroll += 1,
+                1 => app.diff_scroll += 1,
                 _ => {}
-            }
-        }
-
-        Action::NavUp => {
-            match app.screen {
-                Screen::PrList => app.nav_up(),
-                Screen::DoubleCheck => {
-                    if app.double_check_pane == 1 {
-                        app.double_check_detail_scroll = app.double_check_detail_scroll.saturating_sub(1);
-                    } else {
-                        if app.double_check_selected > 0 {
-                            app.double_check_selected -= 1;
-                            app.double_check_detail_scroll = 0;
-                        }
-                    }
-                }
-                Screen::FileTree => {
-                    if app.file_tree_pane == 1 {
-                        if app.file_tree_line > 0 {
-                            app.file_tree_line -= 1;
-                        }
-                    } else {
-                        if app.pr_list_selected > 0 {
-                            app.pr_list_selected -= 1;
-                            app.file_tree_scroll = 0;
-                            app.file_tree_line = 0;
-                        }
-                    }
-                }
-                Screen::AgentConfig => {
-                    if app.agent_config_selected > 0 {
-                        app.agent_config_selected -= 1;
-                    }
-                }
-                Screen::PrDetail => {
-                    match app.selected_pane {
-                        0 => app.description_scroll = app.description_scroll.saturating_sub(3),
-                        _ => app.diff_scroll = app.diff_scroll.saturating_sub(3),
-                    }
-                }
-                Screen::SummaryPreview => {
-                    if app.summary_pane == 0 {
-                        app.summary_body_scroll = app.summary_body_scroll.saturating_sub(3);
-                    } else {
-                        app.summary_comments_scroll = app.summary_comments_scroll.saturating_sub(1);
-                    }
-                }
-                Screen::ClaudeCodeOutput => {
-                    // k navigates up the task list
-                    if app.fix_task_selected > 0 {
-                        app.fix_task_selected -= 1;
-                        app.claude_output_scroll = 0;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        Action::GoTop => {
-            match app.screen {
-                Screen::DoubleCheck => {
-                    if app.double_check_pane == 1 {
-                        app.double_check_detail_scroll = 0;
-                    } else {
-                        app.double_check_selected = 0;
-                    }
-                }
-                Screen::PrDetail => { app.diff_scroll = 0; }
-                Screen::FileTree => { app.file_tree_scroll = 0; }
-                _ => { app.pr_list_selected = 0; }
-            }
-        }
-
-        Action::GoBottom => {
-            match app.screen {
-                Screen::DoubleCheck => {
-                    if app.double_check_pane == 1 {
-                        // Scroll detail to end — render will clamp to max
-                        app.double_check_detail_scroll = usize::MAX / 2;
-                    } else {
-                        // Jump to last filtered comment
-                        let last = filtered_comment_count(app).saturating_sub(1);
-                        // Map filtered index back to real index
-                        if let Some(draft) = &app.draft {
-                            let comments = &draft.comments;
-                            let count = comments.len();
-                            if count > 0 {
-                                let visible: Vec<usize> = (0..count)
-                                    .filter(|&i| comment_passes_filter(app, i))
-                                    .collect();
-                                if let Some(&real_idx) = visible.get(last) {
-                                    app.double_check_selected = real_idx;
-                                }
-                            }
-                        }
-                    }
-                }
-                Screen::PrDetail => {
-                    let max = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
-                    app.diff_scroll = max.saturating_sub(app.diff_viewport_height);
-                }
-                Screen::FileTree => {
-                    app.file_tree_scroll = usize::MAX / 2; // clamped by render
-                }
-                Screen::ClaudeCodeOutput => {
-                    let line_count = app.fix_tasks.get(app.fix_task_selected)
-                        .map(|t| t.output.lines().count())
-                        .unwrap_or(0);
-                    app.claude_output_scroll = line_count;
-                }
-                _ => { app.go_bottom(); }
-            }
-        }
-
-        Action::ScrollDown => {
-            if app.screen == Screen::FileTree {
-                app.file_tree_scroll = app.file_tree_scroll.saturating_add(5);
-            } else {
-                let max_lines = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
-                let max_scroll = max_lines.saturating_sub(app.diff_viewport_height);
-                app.diff_scroll = (app.diff_scroll + 10).min(max_scroll);
-            }
-        }
-
-        Action::ScrollUp => {
-            if app.screen == Screen::FileTree {
-                app.file_tree_scroll = app.file_tree_scroll.saturating_sub(5);
-            } else {
-                app.diff_scroll = app.diff_scroll.saturating_sub(10);
-            }
-        }
-
-        Action::PageDown => {
-            let max_lines = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
-            let max_scroll = max_lines.saturating_sub(app.diff_viewport_height);
-            app.diff_scroll = (app.diff_scroll + 25).min(max_scroll);
-        }
-
-        Action::PageUp => {
-            app.diff_scroll = app.diff_scroll.saturating_sub(25);
-        }
-
-        Action::ToggleFullscreen => {
-            if app.screen == Screen::PrDetail {
-                app.diff_fullscreen = !app.diff_fullscreen;
-            }
-        }
-
-        Action::NextPane => {
-            if app.screen == Screen::SummaryPreview {
-                app.summary_pane = (app.summary_pane + 1) % 2;
-            } else if app.screen == Screen::DoubleCheck {
-                app.double_check_pane = (app.double_check_pane + 1) % 2;
-            } else {
-                app.selected_pane = (app.selected_pane + 1) % 3;
-            }
-        }
-
-        Action::PrevPane => {
-            if app.screen == Screen::SummaryPreview {
-                app.summary_pane = if app.summary_pane == 0 { 1 } else { 0 };
-            } else if app.screen == Screen::DoubleCheck {
-                app.double_check_pane = if app.double_check_pane == 0 { 1 } else { 0 };
-            } else {
-                app.selected_pane = if app.selected_pane == 0 { 2 } else { app.selected_pane - 1 };
-            }
-        }
-
-        Action::Confirm => match app.screen {
-            Screen::PrList => {
-                open_pr(app, event_tx, config).await;
-            }
-            Screen::FileTree => {
-                // Jump to this file's section in the diff view
-                if let Some(draft) = &app.draft {
-                    if let Some(path) = draft.file_checklist.keys().nth(app.pr_list_selected).cloned() {
-                        if let Some(lines) = &app.diff_lines_cache {
-                            let target = format!("diff --git a/{} b/{}", path, path);
-                            if let Some(pos) = lines.iter().position(|l| l == &target) {
-                                app.diff_scroll = pos;
-                            }
-                        }
-                        app.selected_pane = 1;
-                        app.navigate_back();
-                    }
-                }
-            }
-            Screen::ReviewCompose => {
-                if app.input_mode == InputMode::Insert {
-                    // newline
-                    let pos = app.compose_cursor.min(app.compose_text.len());
-                    app.compose_text.insert(pos, '\n');
-                    app.compose_cursor += 1;
-                } else {
-                    let text = app.compose_text.trim().to_string();
-                    if text.is_empty() {
-                        app.show_error("Comment cannot be empty.");
-                    } else if app.compose_quick_mode {
-                        // Quick comment: show confirmation popup, store pending action
-                        app.pending_publish = Some(crate::app::PendingPublish::QuickComment { text });
-                        app.popup = Some(crate::app::PopupState {
-                            title: "Publish Comment".to_string(),
-                            message: format!("Post comment to PR #{}?\n\nThis will be published immediately as a PR conversation comment.", app.current_pr.as_ref().map(|p| p.number).unwrap_or(0)),
-                            kind: crate::app::PopupKind::ConfirmPublish,
-                        });
-                    } else {
-                        // Inline review comment: save to draft and go to DoubleCheck
-                        save_compose_comment(app);
-                        app.navigate_to(Screen::DoubleCheck);
-                    }
-                }
-            }
-            Screen::SummaryPreview => {
-                publish_review(app, event_tx, config).await;
-            }
+            },
             Screen::DoubleCheck => {
-                // Toggle approve/reject
-                toggle_comment(app);
+                if app.double_check_pane == 0 {
+                    let total = ui::screens::double_check::visible_comment_count(app);
+                    if app.double_check_selected < total.saturating_sub(1) { app.double_check_selected += 1; }
+                } else { app.double_check_detail_scroll += 1; }
+            },
+            Screen::FileTree => {
+                if app.file_tree_pane == 0 {
+                    let max = app.draft.as_ref()
+                        .map(|d| d.file_checklist.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    if app.file_tree_line < max { app.file_tree_line += 1; }
+                } else { app.file_tree_scroll += 1; }
+            }
+            Screen::AgentConfig => { app.agent_config_selected = (app.agent_config_selected + 1).min(app.agents.len().saturating_sub(1)); },
+            _ => {}
+        },
+        Action::NavUp => match app.screen {
+            Screen::PrList => app.nav_up(),
+            Screen::PrDetail => match app.selected_pane {
+                0 => app.description_scroll = app.description_scroll.saturating_sub(1),
+                1 => app.diff_scroll = app.diff_scroll.saturating_sub(1),
+                _ => {}
+            },
+            Screen::DoubleCheck => {
+                if app.double_check_pane == 0 { app.double_check_selected = app.double_check_selected.saturating_sub(1); }
+                else { app.double_check_detail_scroll = app.double_check_detail_scroll.saturating_sub(1); }
+            },
+            Screen::FileTree => { if app.file_tree_pane == 0 { app.file_tree_line = app.file_tree_line.saturating_sub(1); } else { app.file_tree_scroll = app.file_tree_scroll.saturating_sub(1); } },
+            Screen::AgentConfig => { app.agent_config_selected = app.agent_config_selected.saturating_sub(1); },
+            _ => {}
+        },
+
+        Action::NavRight => match app.screen {
+            Screen::FileTree => { app.file_tree_pane = 1; }
+            _ => {}
+        },
+        Action::NavLeft => match app.screen {
+            Screen::FileTree => {
+                if app.file_tree_fullscreen {
+                    // Exit fullscreen first; stay in pane 1
+                    app.file_tree_fullscreen = false;
+                    app.file_tree_split = false;
+                    app.file_tree_scroll = 0;
+                } else {
+                    app.file_tree_pane = 0;
+                }
             }
             _ => {}
         },
 
-        Action::GenerateReview => {
-            if !config.is_llm_configured() {
-                app.show_info(
-                    "AI Unavailable",
-                    "Claude CLI not found and no API key configured.\nInstall Claude Code or set ANTHROPIC_API_KEY.",
-                );
-            } else if app.screen == Screen::DoubleCheck {
-                // From DoubleCheck: run any agents not yet completed (append mode)
-                run_missing_agents(app, config);
-            } else if app.screen == Screen::PrDetail {
-                start_agent_runner(app, config);
-            }
-        }
+        Action::NextPane => match app.screen {
+            Screen::PrDetail => app.selected_pane = (app.selected_pane + 1) % 3,
+            Screen::DoubleCheck => app.double_check_pane = (app.double_check_pane + 1) % 2,
+            Screen::FileTree => app.file_tree_pane = (app.file_tree_pane + 1) % 2,
+            Screen::AgentWizard => {
+                app.wizard_field = match app.wizard_field {
+                    crate::app::AgentWizardField::Id => crate::app::AgentWizardField::Name,
+                    crate::app::AgentWizardField::Name => crate::app::AgentWizardField::Icon,
+                    crate::app::AgentWizardField::Icon => crate::app::AgentWizardField::SystemPrompt,
+                    crate::app::AgentWizardField::SystemPrompt => crate::app::AgentWizardField::Id,
+                };
+            },
+            _ => {}
+        },
 
-        Action::RunMissingAgents => {
-            if config.is_llm_configured() && app.screen == Screen::DoubleCheck {
-                run_missing_agents(app, config);
-            }
-        }
-
-        Action::ClaudeCodeFix => {
-            if app.screen == Screen::DoubleCheck {
-                start_fix_tasks(app, event_tx, config);
-            } else if app.screen == Screen::ClaudeCodeOutput && !app.claude_output_loading {
-                // Retry the selected failed task
-                retry_selected_fix_task(app, event_tx, config);
-            }
-        }
-
-        Action::RestartReview => {
-            if config.is_llm_configured() {
-                let n = app.draft.as_ref().map(|d| d.comments.len()).unwrap_or(0);
-                app.pending_publish = Some(crate::app::PendingPublish::RestartReview);
-                app.popup = Some(crate::app::PopupState {
-                    title: "Restart Review".to_string(),
-                    message: format!(
-                        "Clear all {} existing comment(s) and re-run all enabled agents?\n\nThis cannot be undone.",
-                        n
-                    ),
-                    kind: crate::app::PopupKind::ConfirmRestart,
-                });
-            }
-        }
-
-        Action::ClearCache => {
-            if app.screen == Screen::AgentRunner || app.screen == Screen::PrDetail
-                || app.screen == Screen::DoubleCheck
-            {
-                if let (Some(pr), Some(cfg_gh)) = (
-                    app.current_pr.as_ref(),
-                    Some(&config.github),
-                ) {
-                    let repo_slug = format!("{}/{}", cfg_gh.owner, cfg_gh.repo);
-                    let pr_number = pr.number;
-                    crate::review::cache::delete(pr_number, &repo_slug);
-                    app.set_status(format!("Cache cleared for PR #{pr_number}"));
-                }
-            }
-        }
-
-        Action::HybridReview => {
+        Action::ToggleFullscreen => {
             if app.screen == Screen::PrDetail {
-                if !config.is_llm_configured() {
-                    app.show_info(
-                        "AI Unavailable",
-                        "Claude CLI not found and no API key configured.\nInstall Claude Code or set ANTHROPIC_API_KEY.",
-                    );
+                app.diff_fullscreen = !app.diff_fullscreen;
+                if !app.diff_fullscreen {
+                    app.diff_split_mode = false;
+                }
+                app.diff_scroll = 0;
+            } else if app.screen == Screen::FileTree && app.file_tree_pane == 1 {
+                app.file_tree_fullscreen = !app.file_tree_fullscreen;
+                if !app.file_tree_fullscreen {
+                    app.file_tree_split = false;
+                }
+                app.file_tree_scroll = 0;
+            }
+        }
+        Action::ToggleSplitDiff => {
+            if app.screen == Screen::PrDetail {
+                app.diff_split_mode = !app.diff_split_mode;
+                if app.diff_split_mode {
+                    app.diff_fullscreen = true;
+                }
+                app.diff_scroll = 0;
+            } else if app.screen == Screen::FileTree && app.file_tree_pane == 1 {
+                app.file_tree_split = !app.file_tree_split;
+                if app.file_tree_split {
+                    app.file_tree_fullscreen = true;
+                }
+                app.file_tree_scroll = 0;
+            }
+        }
+
+        // Review Actions
+        Action::GenerateReview => {
+            if app.screen == Screen::PrDetail {
+                if has_existing_review(app) {
+                    app.popup = Some(PopupState {
+                        title: "Existing Review Found".to_string(),
+                        message: "This PR already has review comments.\n[Enter] Discard & restart  |  [Esc] Keep existing".to_string(),
+                        kind: PopupKind::ConfirmRestart,
+                    });
                 } else {
                     start_agent_runner(app, config);
                 }
             }
         }
-
         Action::ManualComment => {
-            if app.screen == Screen::PrDetail {
-                app.compose_text.clear();
-                app.compose_cursor = 0;
-                app.compose_file_path = None;
-                app.compose_line = None;
-                app.compose_context.clear();
-                app.compose_quick_mode = true;
+            if app.screen == Screen::PrDetail || app.screen == Screen::FileTree {
+                app.compose_quick_mode = false;
+                app.compose_editor = crate::ui::editor::PrismEditor::new(String::new());
+                app.editing_comment_id = None;
                 app.navigate_to(Screen::ReviewCompose);
-            } else if app.screen == Screen::FileTree && app.file_tree_pane == 1 {
-                // Get selected file and line for inline comment
-                if let Some(path) = app.draft.as_ref()
-                    .and_then(|d| d.file_checklist.keys().nth(app.pr_list_selected))
-                    .cloned()
-                {
-                    let diff_lines = extract_file_diff_for_compose(app, &path);
-                    let actual_line = get_diff_line_number(&diff_lines, app.file_tree_line);
-
-                    // Collect context: 3 lines before and after selected
-                    let start = app.file_tree_line.saturating_sub(3);
-                    let end = (app.file_tree_line + 4).min(diff_lines.len());
-                    let context: Vec<String> = diff_lines[start..end].to_vec();
-
-                    app.compose_file_path = Some(path);
-                    app.compose_line = actual_line;
-                    app.compose_context = context;
-                    app.compose_text.clear();
-                    app.compose_cursor = 0;
+            } else if app.screen == Screen::DoubleCheck {
+                // [c] on DoubleCheck opens new comment (not edit)
+                app.compose_quick_mode = false;
+                app.compose_editor = crate::ui::editor::PrismEditor::new(String::new());
+                app.editing_comment_id = None;
+                app.navigate_to(Screen::ReviewCompose);
+            }
+        }
+        Action::GenerateBody => {
+            // [g] key — edit selected comment in DoubleCheck
+            if app.screen == Screen::DoubleCheck {
+                if let Some((_, comment)) = ui::screens::double_check::comment_at(app, app.double_check_selected) {
+                    let body = comment.effective_body().to_string();
+                    let id = comment.id;
+                    app.compose_editor = crate::ui::editor::PrismEditor::new(body);
+                    app.editing_comment_id = Some(id);
                     app.compose_quick_mode = false;
                     app.navigate_to(Screen::ReviewCompose);
                 }
             }
         }
-
-        Action::FileTree => {
-            if matches!(app.screen, Screen::PrDetail | Screen::ReviewCompose) {
-                // Parse changed files from diff and populate checklist
-                let diff_files: Vec<String> = if let Some(diff) = &app.current_diff {
-                    diff.lines()
-                        .filter(|l| l.starts_with("diff --git "))
-                        .filter_map(|l| l.split(" b/").nth(1).map(str::to_string))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                if !diff_files.is_empty() {
-                    let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
-                    let draft = app.draft.get_or_insert_with(|| {
-                        review::models::ReviewDraft::new(pr_num, review::models::ReviewMode::ManualOnly)
+        Action::HybridReview => {
+            if app.screen == Screen::PrDetail {
+                if has_existing_review(app) {
+                    app.popup = Some(PopupState {
+                        title: "Existing Review Found".to_string(),
+                        message: "This PR already has review comments.\n[Enter] Discard & restart  |  [Esc] Keep existing".to_string(),
+                        kind: PopupKind::ConfirmRestart,
                     });
-                    for f in diff_files {
-                        draft.file_checklist.entry(f).or_insert(false);
-                    }
+                } else {
+                    start_agent_runner(app, config);
                 }
-                app.navigate_to(Screen::FileTree);
             }
         }
-
         Action::OpenDoubleCheck => {
-            if matches!(app.screen, Screen::PrDetail | Screen::FileTree | Screen::ReviewCompose) {
-                // Ensure draft exists so DoubleCheck has somewhere to land
-                let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
-                app.draft.get_or_insert_with(|| {
-                    review::models::ReviewDraft::new(pr_num, review::models::ReviewMode::ManualOnly)
-                });
+            if let Some(pr) = &app.current_pr {
+                let pr_num = pr.number;
+                app.draft.get_or_insert_with(|| review::models::ReviewDraft::new(pr_num, review::models::ReviewMode::ManualOnly));
+                if let (Some(draft), Some(diff)) = (&mut app.draft, &app.current_diff.clone()) {
+                    populate_checklist_from_diff(draft, diff);
+                }
                 app.navigate_to(Screen::DoubleCheck);
             }
         }
-
-        Action::AgentConfig => {
-            app.navigate_to(Screen::AgentConfig);
+        
+        Action::AgentWizard => {
+            app.wizard_id.clear(); app.wizard_name.clear(); app.wizard_icon = "🤖".to_string();
+            app.wizard_prompt_editor = crate::ui::editor::PrismEditor::new(String::new());
+            app.wizard_field = crate::app::AgentWizardField::Id;
+            app.navigate_to(Screen::AgentWizard);
         }
 
-        Action::Settings => {
-            app.navigate_to(Screen::Settings);
-        }
-
-        Action::ReloadConfig => {
-            let tx = event_tx.clone();
-            app.set_status("Reloading configuration…");
-            tokio::spawn(async move {
-                match crate::config::AppConfig::load() {
-                    Ok(cfg) => {
-                        let agents = crate::agents::loader::load_agents(&cfg).unwrap_or_default();
-                        let _ = tx.send(AppEvent::ConfigReloaded(cfg, agents));
+        Action::Char(c) => {
+            if app.screen == Screen::AgentWizard {
+                match app.wizard_field {
+                    crate::app::AgentWizardField::Id => app.wizard_id.push(c),
+                    crate::app::AgentWizardField::Name => app.wizard_name.push(c),
+                    crate::app::AgentWizardField::Icon => {
+                        app.wizard_icon.clear();
+                        app.wizard_icon.push(c);
                     }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!("Failed to reload config: {e}")));
-                    }
+                    crate::app::AgentWizardField::SystemPrompt => {}
                 }
-            });
-        }
-
-        Action::OpenBrowser => {
-            let url = match &app.screen {
-                Screen::PrList => app.selected_pr().map(|p| p.html_url.clone()),
-                Screen::PrDetail => app.current_pr.as_ref().map(|p| p.html_url.clone()),
-                _ => None,
-            };
-            if let Some(url) = url {
-                // Best-effort: open URL in the default browser
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(&url)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
             }
         }
-
-        Action::Refresh => {
-            if app.screen == Screen::PrList && config.is_github_configured() {
-                app.pr_list_loading = true;
-                app.pr_list.clear();
-                let tx = event_tx.clone();
-                let cfg = config.clone();
-                tokio::spawn(async move {
-                    match load_pr_list(&cfg).await {
-                        Ok(prs) => {
-                            let _ = tx.send(AppEvent::PrListLoaded(prs));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(AppEvent::Error(format!("Refresh failed: {e}")));
-                        }
-                    }
-                });
+        Action::Delete => {
+            if app.screen == Screen::AgentWizard {
+                match app.wizard_field {
+                    crate::app::AgentWizardField::Id => { app.wizard_id.pop(); }
+                    crate::app::AgentWizardField::Name => { app.wizard_name.pop(); }
+                    crate::app::AgentWizardField::Icon => { app.wizard_icon.pop(); }
+                    crate::app::AgentWizardField::SystemPrompt => {}
+                }
+            } else if app.screen == Screen::DoubleCheck {
+                // [Del] — confirm before deleting selected comment
+                if let Some((_, comment)) = ui::screens::double_check::comment_at(app, app.double_check_selected) {
+                    let local_id = comment.id;
+                    let has_github = comment.github_id.is_some();
+                    app.pending_delete_comment = Some(local_id);
+                    let msg = if has_github {
+                        "Remove this comment locally AND delete it from GitHub?".to_string()
+                    } else {
+                        "Remove this comment from the review?".to_string()
+                    };
+                    app.popup = Some(PopupState {
+                        title: "Delete comment".to_string(),
+                        message: msg,
+                        kind: PopupKind::ConfirmDeleteComment,
+                    });
+                }
             }
         }
+        Action::EnterInsert => { app.input_mode = InputMode::Insert; }
+        Action::ExitInsert => { app.input_mode = InputMode::Normal; }
 
-        Action::Search => {
-            if app.screen == Screen::PrList {
-                app.input_mode = InputMode::Insert;
-                app.pr_list_filter.clear();
+        Action::Confirm => match app.screen {
+            Screen::PrList => { open_pr(app, event_tx, config).await; }
+            Screen::ReviewCompose => {
+                save_or_update_comment(app, event_tx, config).await;
+                app.navigate_back();
             }
+            Screen::AgentWizard => {
+                if app.wizard_id.is_empty() { app.show_error("ID is required"); }
+                else {
+                    let _ = save_agent_to_disk(app);
+                    app.agents = agents::loader::load_agents(config).unwrap_or_default();
+                    app.navigate_back();
+                }
+            }
+            _ => {}
         }
 
         Action::ToggleItem => {
-            match app.screen {
-                Screen::DoubleCheck => toggle_comment(app),
-                Screen::AgentConfig => {
-                    if let Some(agent) = app.agents.get_mut(app.agent_config_selected) {
-                        agent.agent.enabled = !agent.agent.enabled;
-                    }
+            if app.screen == Screen::DoubleCheck { toggle_comment(app); }
+            else if app.screen == Screen::AgentConfig {
+                if let Some(agent) = app.agents.get_mut(app.agent_config_selected) {
+                    agent.agent.enabled = !agent.agent.enabled;
                 }
-                _ => {}
             }
         }
 
         Action::SelectAll => {
             if app.screen == Screen::DoubleCheck {
                 if let Some(draft) = &mut app.draft {
-                    draft.approve_all();
-                }
-            }
-        }
-
-        Action::DeselectAll => {
-            if app.screen == Screen::DoubleCheck {
-                if let Some(draft) = &mut app.draft {
                     for c in &mut draft.comments {
-                        c.status = crate::review::models::CommentStatus::Rejected;
+                        if c.status != review::models::CommentStatus::Approved {
+                            c.status = review::models::CommentStatus::Approved;
+                        }
                     }
                 }
             }
         }
-
-        Action::PreviewSummary => {
+        Action::DeselectAll => {
             if app.screen == Screen::DoubleCheck {
-                // Navigate to preview — body stays as-is (empty or previously generated)
-                app.summary_body_scroll = 0;
-                app.summary_comments_scroll = 0;
-                app.summary_pane = 0;
-                app.navigate_to(Screen::SummaryPreview);
-            }
-        }
-
-        Action::GenerateBody => {
-            if app.screen == Screen::SummaryPreview {
                 if let Some(draft) = &mut app.draft {
-                    let body = draft.generate_body_with_format(&app.config.publishing.format);
-                    draft.review_body = Some(body);
-                    app.summary_body_scroll = 0;
+                    for c in &mut draft.comments {
+                        c.status = review::models::CommentStatus::Rejected;
+                    }
                 }
-                app.set_status("Review body generated.");
             }
         }
-
-        Action::InsertSuggestion => {
-            if app.screen == Screen::ReviewCompose && app.input_mode != InputMode::Insert {
-                // Build a suggestion block pre-filled with the current line's code
-                let current_code = app.compose_context
-                    .get(app.compose_context.len() / 2)
-                    .map(|l| if l.len() > 1 { l[1..].to_string() } else { String::new() })
-                    .unwrap_or_default();
-                let suggestion = format!("```suggestion\n{}\n```", current_code);
-                app.compose_text = suggestion;
-                app.compose_cursor = app.compose_text.len();
-                app.input_mode = InputMode::Normal;
-                app.set_status("Suggestion template inserted — edit the code block, then [Enter] to add.");
+        Action::PreviewSummary => { if app.screen == Screen::DoubleCheck { app.navigate_to(Screen::SummaryPreview); } }
+        Action::Publish => {
+            if app.screen == Screen::SummaryPreview {
+                app.pending_publish = Some(crate::app::PendingPublish::FullReview);
+                app.popup = Some(PopupState {
+                    title: "Publish Review".to_string(),
+                    message: "Submit all approved comments to GitHub?".to_string(),
+                    kind: PopupKind::ConfirmPublish,
+                });
             }
         }
 
         Action::CheckFile => {
             if app.screen == Screen::FileTree {
                 if let Some(draft) = &mut app.draft {
-                    let key = draft
-                        .file_checklist
-                        .keys()
-                        .nth(app.pr_list_selected)
-                        .cloned();
-                    if let Some(k) = key {
-                        let val = draft.file_checklist.get_mut(&k).unwrap();
-                        *val = !*val;
+                    if let Some((_path, checked)) = draft.file_checklist.iter_mut().nth(app.file_tree_line) {
+                        *checked = !*checked;
                     }
                 }
             }
         }
 
-        Action::Delete => {
-            if app.input_mode == InputMode::Insert {
-                // Backspace in editor
-                match app.screen {
-                    Screen::ReviewCompose => {
-                        if app.compose_cursor > 0 {
-                            let pos = (app.compose_cursor - 1).min(app.compose_text.len());
-                            if app.compose_text.is_char_boundary(pos) {
-                                app.compose_text.remove(pos);
-                                app.compose_cursor = pos;
-                            }
-                        }
-                    }
-                    Screen::PrList => {
-                        app.pr_list_filter.pop();
-                    }
-                    _ => {}
-                }
+        Action::InsertSuggestion => {
+            if app.screen == Screen::ReviewCompose {
+                let template = "```suggestion\n\n```".to_string();
+                app.compose_editor = crate::ui::editor::PrismEditor::new(template);
+                app.compose_editor.is_insert_mode = true;
+                app.input_mode = InputMode::Insert;
             }
         }
 
-        Action::Char(c) => {
-            if app.input_mode == InputMode::Insert {
-                match app.screen {
-                    Screen::ReviewCompose => {
-                        let pos = app.compose_cursor.min(app.compose_text.len());
-                        app.compose_text.insert(pos, c);
-                        app.compose_cursor += c.len_utf8();
-                    }
-                    Screen::PrList => {
-                        app.pr_list_filter.push(c);
-                        app.pr_list_selected = 0;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        Action::FilterAgent(n) => {
-            if app.screen == Screen::DoubleCheck {
-                if app.agent_filter == Some(n) {
-                    app.agent_filter = None; // toggle off
-                } else {
-                    app.agent_filter = Some(n);
-                }
-                app.double_check_selected = 0;
-            }
-        }
-
-        Action::Publish => {
-            if app.screen == Screen::SummaryPreview {
-                let event_name = match app.summary_event_idx {
-                    0 => "COMMENT",
-                    1 => "REQUEST_CHANGES",
-                    _ => "APPROVE",
-                };
-                let n = app.draft.as_ref().map(|d| d.submittable_count()).unwrap_or(0);
-                app.pending_publish = Some(crate::app::PendingPublish::FullReview);
-                app.popup = Some(crate::app::PopupState {
-                    title: "Submit Review".to_string(),
-                    message: format!("Submit review to PR #{}?\n\nType: {}\nInline comments: {}",
-                        app.current_pr.as_ref().map(|p| p.number).unwrap_or(0),
-                        event_name, n),
-                    kind: crate::app::PopupKind::ConfirmPublish,
-                });
-            }
-        }
-
-        Action::Help => {
-            app.show_help = !app.show_help;
-            app.show_stats = false; // close stats if open
-        }
-
-        Action::ShowStats => {
-            app.show_stats = !app.show_stats;
-            app.show_help = false; // close help if open
-        }
-
-        Action::NavLeft => {
-            if app.screen == Screen::SummaryPreview && app.summary_event_idx > 0 {
-                app.summary_event_idx -= 1;
-            } else if app.screen == Screen::FileTree && app.file_tree_pane == 1 {
-                app.file_tree_pane = 0;
-            }
-        }
-
-        Action::NavRight => {
-            if app.screen == Screen::SummaryPreview && app.summary_event_idx + 1 < 3 {
-                app.summary_event_idx += 1;
-            } else if app.screen == Screen::FileTree && app.file_tree_pane == 0 {
-                app.file_tree_pane = 1;
-                app.file_tree_line = 0;
-            }
-        }
+        Action::ShowStats => { app.show_stats = !app.show_stats; }
+        Action::Settings => { app.navigate_to(Screen::Settings); }
+        Action::AgentConfig => { app.navigate_to(Screen::AgentConfig); }
+        Action::Help => { app.show_help = !app.show_help; }
+        Action::FileTree => { if app.current_pr.is_some() { app.navigate_to(Screen::FileTree); } }
+        Action::OpenBrowser => { if let Some(pr) = &app.current_pr { let _ = std::process::Command::new("xdg-open").arg(&pr.html_url).spawn(); } }
+        _ => {}
     }
 }
 
-async fn handle_setup_action(
-    app: &mut App,
-    action: Action,
-    event_tx: &mpsc::UnboundedSender<AppEvent>,
-) {
-    use app::SetupField;
+fn has_existing_review(app: &App) -> bool {
+    let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
+    app.draft.as_ref()
+        .map(|d| d.pr_number == pr_num && !d.comments.is_empty())
+        .unwrap_or(false)
+}
 
-    match action {
-        Action::Quit | Action::Back => {
-            app.should_quit = true;
-        }
-
-        // Tab: switch between Owner and Repo fields
-        Action::NextPane | Action::PrevPane => {
-            app.setup_field = match app.setup_field {
-                SetupField::Owner => SetupField::Repo,
-                SetupField::Repo  => SetupField::Owner,
-            };
-        }
-
-        // Enter: confirm and save
-        Action::Confirm => {
-            if app.setup_owner.trim().is_empty() || app.setup_repo.trim().is_empty() {
-                app.show_error("Owner and repository name cannot be empty.");
-                return;
-            }
-            app.setup_saving = true;
-
-            let token = app.setup_gh_token.clone();
-            let owner = app.setup_owner.trim().to_string();
-            let repo  = app.setup_repo.trim().to_string();
-            let tx    = event_tx.clone();
-
-            tokio::spawn(async move {
-                match config::AppConfig::save_github_config(&token, &owner, &repo) {
-                    Ok(()) => {
-                        let _ = tx.send(AppEvent::SetupSaved(token, owner, repo));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::SetupFailed(format!("{:#}", e)));
+fn populate_checklist_from_diff(draft: &mut review::models::ReviewDraft, diff: &str) {
+    if draft.file_checklist.is_empty() {
+        for line in diff.lines() {
+            if let Some(rest) = line.strip_prefix("diff --git ") {
+                if let Some(b_part) = rest.split(" b/").nth(1) {
+                    let path = b_part.trim().to_string();
+                    if !path.is_empty() {
+                        draft.file_checklist.insert(path, false);
                     }
                 }
-            });
-        }
-
-        // Typing: update the focused field
-        Action::Char(c) => {
-            match app.setup_field {
-                SetupField::Owner => app.setup_owner.push(c),
-                SetupField::Repo  => app.setup_repo.push(c),
             }
         }
-
-        // Backspace
-        Action::Delete => {
-            match app.setup_field {
-                SetupField::Owner => { app.setup_owner.pop(); }
-                SetupField::Repo  => { app.setup_repo.pop(); }
-            }
-        }
-
-        _ => {}
     }
 }
 
 fn handle_agent_update(app: &mut App, update: agents::orchestrator::AgentUpdate) {
     use agents::models::AgentStatus;
-
-    // Accumulate token stats when an agent completes
-    if let agents::models::AgentStatus::Done { input_tokens, output_tokens, .. } = &update.status {
-        app.token_input_total += input_tokens;
-        app.token_output_total += output_tokens;
-        app.token_calls_total += 1;
+    if let AgentStatus::Done { input_tokens, output_tokens, .. } = &update.status {
+        let model = app.config.llm.model.clone();
+        let now = chrono::Utc::now();
+        let stats = app.model_stats.entry(model).or_default();
+        stats.calls += 1;
+        stats.input_tokens += *input_tokens;
+        stats.output_tokens += *output_tokens;
+        if stats.start_date.is_none() {
+            stats.start_date = Some(now);
+        }
+        let day_key = now.format("%Y-%m-%d").to_string();
+        let day = stats.daily.entry(day_key).or_default();
+        day.calls += 1;
+        day.input_tokens += *input_tokens;
+        day.output_tokens += *output_tokens;
     }
-
-    // If all agents are done/failed/skipped and we're on AgentRunner, move to DoubleCheck
     app.agent_statuses.insert(update.agent_id, update.status);
 
     if app.screen == Screen::AgentRunner {
-        let all_done = app.agents.iter().all(|a| {
-            match app.agent_statuses.get(&a.agent.id) {
-                Some(AgentStatus::Done { .. })
-                | Some(AgentStatus::Failed { .. })
-                | Some(AgentStatus::Skipped { .. })
-                | Some(AgentStatus::Disabled) => true,
-                _ => false,
-            }
+        let all_done = app.agents.iter().filter(|a| a.agent.enabled).all(|a| {
+            matches!(app.agent_statuses.get(&a.agent.id), 
+                Some(AgentStatus::Done {..}) | Some(AgentStatus::Failed {..}) | Some(AgentStatus::Skipped {..}))
         });
-
-        if all_done && !app.agents.is_empty() {
-            // Collect comments from Done agents into the draft
+        if all_done {
             if let Some(draft) = &mut app.draft {
-                for (id, status) in &app.agent_statuses {
+                for status in app.agent_statuses.values() {
                     if let AgentStatus::Done { comments, .. } = status {
-                        for c in comments {
-                            // Use add_comment to enable our new de-duplication logic
-                            draft.add_comment(c.clone());
-                        }
-                    }                    let _ = id;
+                        for c in comments { draft.add_comment(c.clone()); }
+                    }
                 }
             }
             app.navigate_to(Screen::DoubleCheck);
@@ -1316,776 +774,236 @@ fn handle_agent_update(app: &mut App, update: agents::orchestrator::AgentUpdate)
     }
 }
 
-// ── Helper functions ───────────────────────────────────────────────────────
+fn handle_sequence(app: &mut App, seq: KeySequence) {
+    match seq {
+        KeySequence::GoTop => app.go_top(),
+        _ => {}
+    }
+}
 
-async fn open_pr(
-    app: &mut App,
-    event_tx: &mpsc::UnboundedSender<AppEvent>,
-    config: &config::AppConfig,
-) {
-    let pr_num = match app.selected_pr() {
-        Some(pr) => pr.number,
-        None => return,
-    };
+async fn make_github_api(config: &config::AppConfig) -> Result<github::api::GitHubApi> {
+    let client = github::client::GitHubClient::new(&config.github.token, &config.github.owner, &config.github.repo)?;
+    Ok(github::api::GitHubApi::new(client))
+}
 
-    app.current_pr = None;
-    app.current_diff = None;
-    app.diff_lines_cache = None;
-    app.current_ticket = None;
-    app.pr_loading = true;
-    app.diff_loading = true;
-    app.diff_scroll = 0;
-    app.description_scroll = 0;
-    app.selected_pane = 1;
+async fn load_pr_list(config: &config::AppConfig) -> Result<Vec<github::models::PrSummary>> {
+    let api = make_github_api(config).await?;
+    api.list_prs(config.github.per_page).await
+}
 
+async fn load_pr_details(config: &config::AppConfig, pr_num: u64) -> Result<github::models::PrDetails> {
+    let api = make_github_api(config).await?;
+    api.get_pr_details(pr_num).await
+}
+
+async fn load_pr_diff(config: &config::AppConfig, pr_num: u64) -> Result<String> {
+    let api = make_github_api(config).await?;
+    api.get_pr_diff(pr_num).await
+}
+
+async fn open_pr(app: &mut App, event_tx: &mpsc::UnboundedSender<AppEvent>, config: &config::AppConfig) {
+    let pr_num = match app.selected_pr() { Some(pr) => pr.number, None => return };
+    app.pr_loading = true; app.diff_loading = true;
     app.navigate_to(Screen::PrDetail);
 
-    // Load PR details
-    {
-        let tx = event_tx.clone();
-        let cfg = config.clone();
-        tokio::spawn(async move {
-            match load_pr_details(&cfg, pr_num).await {
-                Ok(pr) => {
-                    let _ = tx.send(AppEvent::PrLoaded(Box::new(pr)));
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to load PR: {e}")));
-                }
-            }
-        });
-    }
+    let tx = event_tx.clone();
+    let cfg = config.clone();
+    tokio::spawn(async move {
+        match load_pr_details(&cfg, pr_num).await {
+            Ok(pr) => { let _ = tx.send(AppEvent::PrLoaded(Box::new(pr))); }
+            Err(e) => { let _ = tx.send(AppEvent::Error(e.to_string())); }
+        }
+    });
 
-    // Load diff
-    {
-        let tx = event_tx.clone();
-        let cfg = config.clone();
-        tokio::spawn(async move {
-            match load_pr_diff(&cfg, pr_num).await {
-                Ok(diff) => {
-                    let _ = tx.send(AppEvent::DiffLoaded(diff));
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to load diff: {e}")));
-                }
-            }
-        });
-    }
+    let tx = event_tx.clone();
+    let cfg = config.clone();
+    tokio::spawn(async move {
+        match load_pr_diff(&cfg, pr_num).await {
+            Ok(diff) => { let _ = tx.send(AppEvent::DiffLoaded(diff)); }
+            Err(e) => { let _ = tx.send(AppEvent::Error(e.to_string())); }
+        }
+    });
 
-    // Load ticket (best-effort) — search title + branch for ticket keys
-    {
-        let tx = event_tx.clone();
-        let cfg = config.clone();
-        let pr_text = match app.selected_pr() {
-            Some(pr) => format!("{} {}", pr.title, pr.head_branch),
-            None => String::new(),
-        };
-        tokio::spawn(async move {
-            let ticket = load_ticket_for_pr(&cfg, &pr_text).await;
-            let _ = tx.send(AppEvent::TicketLoaded(ticket));
-        });
-    }
-
-    // Load existing reviews and inline comments from GitHub
-    {
-        let tx = event_tx.clone();
-        let cfg = config.clone();
-        tokio::spawn(async move {
-            let api = match make_github_api(&cfg) {
-                Ok(a) => a,
-                Err(_) => return,
-            };
+    // Load existing reviews and inline comments
+    let tx = event_tx.clone();
+    let cfg = config.clone();
+    tokio::spawn(async move {
+        if let Ok(api) = make_github_api(&cfg).await {
             let reviews = api.list_reviews(pr_num).await.unwrap_or_default();
             let comments = api.list_inline_comments(pr_num).await.unwrap_or_default();
             let _ = tx.send(AppEvent::ReviewsLoaded(reviews, comments));
-        });
-    }
+        }
+    });
 }
 
 fn start_agent_runner(app: &mut App, config: &config::AppConfig) {
     use agents::context::ReviewContext;
     use agents::orchestrator::Orchestrator;
-    use review::models::{ReviewDraft, ReviewMode};
-
-    // If a previous review exists with comments, ask user what to do
-    if let Some(draft) = &app.draft {
-        if !draft.comments.is_empty() {
-            let n = draft.comments.len();
-            let date = draft.started_at.format("%Y-%m-%d %H:%M UTC").to_string();
-            app.pending_publish = Some(crate::app::PendingPublish::RestartReview);
-            app.popup = Some(crate::app::PopupState {
-                title: "Review In Progress".to_string(),
-                message: format!(
-                    "Review started {date} — {n} comment(s) already generated.\n\n\
-                     [Enter] Restart from scratch (clear all comments)\n\
-                     [Esc]   Resume existing (go to Double-Check)\n\n\
-                     To run only missing agents, press [Esc] then [r] in Double-Check."
-                ),
-                kind: crate::app::PopupKind::ConfirmRestart,
-            });
-            return;
-        }
-    }
-
-    let pr = match &app.current_pr {
-        Some(pr) => pr.clone(),
-        None => {
-            app.show_error("No PR loaded — open a PR first.");
-            return;
-        }
-    };
-
+    let pr = match &app.current_pr { Some(p) => p.clone(), None => return };
     let diff = app.current_diff.clone().unwrap_or_default();
-    let ticket = app.current_ticket.clone();
     let repo_slug = format!("{}/{}", config.github.owner, config.github.repo);
-    let ctx = ReviewContext::from_pr(&pr, &diff, ticket, &repo_slug);
-
-    let pr_num = pr.number;
-    app.draft = Some(ReviewDraft::new(pr_num, ReviewMode::AiOnly));
+    let ctx = ReviewContext::from_pr(&pr, &diff, None, &repo_slug);
+    
+    app.draft = Some(review::models::ReviewDraft::new(pr.number, review::models::ReviewMode::AiOnly));
+    if let (Some(draft), Some(diff)) = (&mut app.draft, &app.current_diff) {
+        populate_checklist_from_diff(draft, diff);
+    }
     app.agent_statuses.clear();
-
-    // Pre-populate Pending status so the screen renders immediately
-    for agent in app.agents.iter().filter(|a| a.agent.enabled) {
-        app.agent_statuses.insert(
-            agent.agent.id.clone(),
-            agents::models::AgentStatus::Pending,
-        );
-    }
-
     app.navigate_to(Screen::AgentRunner);
 
-    // Launch the orchestrator; updates arrive via app.agent_rx
     let orchestrator = Orchestrator::new(config.clone());
-    let rx = orchestrator.run_all(app.agents.clone(), ctx);
+    let (rx, abort) = orchestrator.run_all(app.agents.clone(), ctx);
     app.agent_rx = Some(rx);
+    app.agent_abort = Some(abort);
 }
 
-/// Run only agents that haven't completed yet (no Done/Disabled status), appending results to
-/// the existing draft instead of replacing it.
-fn run_missing_agents(app: &mut App, config: &config::AppConfig) {
-    use agents::context::ReviewContext;
-    use agents::models::AgentStatus;
-    use agents::orchestrator::Orchestrator;
-    use review::models::{ReviewDraft, ReviewMode};
+async fn save_or_update_comment(app: &mut App, event_tx: &mpsc::UnboundedSender<AppEvent>, config: &config::AppConfig) {
+    use review::models::{CommentSource, GeneratedComment, Severity};
+    let text = app.compose_editor.get_text();
+    if text.trim().is_empty() { return; }
 
-    let pr = match &app.current_pr {
-        Some(pr) => pr.clone(),
-        None => {
-            app.show_error("No PR loaded — open a PR first.");
-            return;
-        }
-    };
+    if let Some(edit_id) = app.editing_comment_id.take() {
+        // Edit mode — update existing comment
+        let (github_id, is_review_summary) = app.draft.as_ref()
+            .and_then(|d| d.comments.iter().find(|c| c.id == edit_id))
+            .map(|c| (c.github_id, matches!(c.source, CommentSource::GithubReview { .. })))
+            .unwrap_or((None, false));
 
-    // Determine which agents still need to run
-    let missing: Vec<_> = app.agents
-        .iter()
-        .filter(|a| {
-            if !a.agent.enabled { return false; }
-            match app.agent_statuses.get(&a.agent.id) {
-                Some(AgentStatus::Done { .. }) | Some(AgentStatus::Disabled) => false,
-                _ => true, // Pending, Running, Failed, or not started
-            }
-        })
-        .cloned()
-        .collect();
-
-    if missing.is_empty() {
-        app.show_info(
-            "All Agents Done",
-            "All enabled agents have already completed.\n\nUse [R] to restart from scratch.",
-        );
-        return;
-    }
-
-    let diff = app.current_diff.clone().unwrap_or_default();
-    let ticket = app.current_ticket.clone();
-    let repo_slug = format!("{}/{}", config.github.owner, config.github.repo);
-    let ctx = ReviewContext::from_pr(&pr, &diff, ticket, &repo_slug);
-
-    // Keep existing draft or create one; keep existing comments
-    let pr_num = pr.number;
-    if app.draft.is_none() {
-        app.draft = Some(ReviewDraft::new(pr_num, ReviewMode::AiOnly));
-    }
-
-    // Mark missing agents as Pending in status map
-    for agent in &missing {
-        app.agent_statuses.insert(
-            agent.agent.id.clone(),
-            agents::models::AgentStatus::Pending,
-        );
-    }
-
-    let n = missing.len();
-    app.navigate_to(Screen::AgentRunner);
-    app.set_status(format!("Running {} missing agent(s)…", n));
-
-    let orchestrator = Orchestrator::new(config.clone());
-    let rx = orchestrator.run_all(missing, ctx);
-    app.agent_rx = Some(rx);
-}
-
-fn count_file_diff_lines(app: &App, path: &str) -> usize {
-    app.current_diff.as_deref().map(|diff| {
-        let target = format!("diff --git a/{} b/{}", path, path);
-        let mut count = 0;
-        let mut found = false;
-        for line in diff.lines() {
-            if line == target { found = true; }          // include the header line in count
-            else if found && line.starts_with("diff --git ") { break; }
-            if found { count += 1; }
-        }
-        count
-    }).unwrap_or(0)
-}
-
-fn extract_file_diff_for_compose(app: &App, path: &str) -> Vec<String> {
-    app.current_diff.as_deref().map(|diff| {
-        let target = format!("diff --git a/{} b/{}", path, path);
-        let mut result = Vec::new();
-        let mut found = false;
-        for line in diff.lines() {
-            if line == target { found = true; }
-            else if found && line.starts_with("diff --git ") { break; }
-            if found { result.push(line.to_string()); }
-        }
-        result
-    }).unwrap_or_default()
-}
-
-/// Compute the actual source line number for a given visual line index in a file diff.
-fn get_diff_line_number(diff_lines: &[String], line_idx: usize) -> Option<u32> {
-    let mut hunk_start: Option<u32> = None;
-    let mut offset: u32 = 0;
-
-    for (i, line) in diff_lines.iter().enumerate() {
-        if line.starts_with("@@ ") {
-            // Parse "+start" from "@@ -a,b +start,len @@"
-            hunk_start = line.split('+').nth(1)
-                .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
-                .and_then(|s| s.parse::<u32>().ok());
-            offset = 0;
-            if i == line_idx { return hunk_start; }
-        } else if hunk_start.is_some() {
-            if i == line_idx {
-                return hunk_start.map(|s| s + offset.saturating_sub(1));
-            }
-            if !line.starts_with('-') {
-                offset += 1;
+        if let Some(draft) = &mut app.draft {
+            if let Some(comment) = draft.comments.iter_mut().find(|c| c.id == edit_id) {
+                comment.edited_body = Some(text.clone());
             }
         }
-    }
-    None
-}
 
-fn save_compose_comment(app: &mut App) {
-    use review::models::{CommentSource, GeneratedComment, ReviewDraft, ReviewMode, Severity};
-    let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
-    if app.draft.is_none() {
-        app.draft = Some(ReviewDraft::new(pr_num, ReviewMode::ManualOnly));
-    }
-    if !app.compose_text.trim().is_empty() {
+        // Sync to GitHub if this came from GitHub
+        if let (Some(gh_id), Some(pr)) = (github_id, app.current_pr.as_ref().map(|p| p.number)) {
+            let tx = event_tx.clone();
+            let cfg = config.clone();
+            let local_id = edit_id;
+            let new_body = text.clone();
+            tokio::spawn(async move {
+                if let Ok(api) = make_github_api(&cfg).await {
+                    let result = if is_review_summary {
+                        api.update_review(pr, gh_id, &new_body).await
+                    } else {
+                        api.update_review_comment(gh_id, &new_body).await
+                    };
+                    match result {
+                        Ok(_) => { let _ = tx.send(AppEvent::CommentUpdated(local_id, new_body)); }
+                        Err(e) => { let _ = tx.send(AppEvent::Error(format!("Update failed: {e}"))); }
+                    }
+                }
+            });
+        }
+    } else {
+        // Create mode — add new comment
         let comment = GeneratedComment::new(
             CommentSource::Manual,
-            app.compose_text.clone(),
+            text,
             Severity::Suggestion,
             app.compose_file_path.clone(),
             app.compose_line,
         );
-        if let Some(draft) = &mut app.draft {
-            draft.add_comment(comment);
-            // Add to file_checklist if file not already there
-            if let Some(ref path) = app.compose_file_path {
-                draft.file_checklist.entry(path.clone()).or_insert(false);
-            }
-        }
-    }
-    app.compose_text.clear();
-    app.compose_cursor = 0;
-    app.compose_file_path = None;
-    app.compose_line = None;
-    app.compose_context.clear();
-}
-
-/// Returns how many comments pass the current agent filter.
-fn filtered_comment_count(app: &App) -> usize {
-    match &app.draft {
-        None => 0,
-        Some(d) => (0..d.comments.len())
-            .filter(|&i| comment_passes_filter(app, i))
-            .count(),
+        if let Some(draft) = &mut app.draft { draft.add_comment(comment); }
     }
 }
 
-/// Returns true if the comment at `idx` passes the current agent filter.
-fn comment_passes_filter(app: &App, idx: usize) -> bool {
-    use review::models::CommentSource;
-    let filter = match app.agent_filter {
-        None => return true,
-        Some(f) => f,
-    };
-    let comment = match app.draft.as_ref().and_then(|d| d.comments.get(idx)) {
-        Some(c) => c,
-        None => return false,
-    };
-    match &comment.source {
-        CommentSource::Agent { agent_id, .. } => {
-            let idx_1based = app.agents.iter()
-                .position(|a| a.agent.id == *agent_id)
-                .map(|i| i as u8 + 1)
-                .unwrap_or(0);
-            idx_1based == filter
-        }
-        CommentSource::Manual => filter == 0,
+fn save_compose_comment(app: &mut App) {
+    use review::models::{CommentSource, GeneratedComment, Severity};
+    let text = app.compose_editor.get_text();
+    if !text.trim().is_empty() {
+        let comment = GeneratedComment::new(
+            CommentSource::Manual,
+            text,
+            Severity::Suggestion,
+            app.compose_file_path.clone(),
+            app.compose_line,
+        );
+        if let Some(draft) = &mut app.draft { draft.add_comment(comment); }
     }
 }
 
 fn toggle_comment(app: &mut App) {
     use review::models::CommentStatus;
-    if let Some(draft) = &mut app.draft {
-        if let Some(comment) = draft.comments.get_mut(app.double_check_selected) {
+    // Resolve visual index → original draft index via threaded order
+    let orig_idx = ui::screens::double_check::comment_at(app, app.double_check_selected)
+        .map(|(i, _)| i);
+    if let (Some(idx), Some(draft)) = (orig_idx, &mut app.draft) {
+        if let Some(comment) = draft.comments.get_mut(idx) {
             comment.status = match comment.status {
-                CommentStatus::Pending | CommentStatus::Rejected => CommentStatus::Approved,
                 CommentStatus::Approved => CommentStatus::Rejected,
+                _ => CommentStatus::Approved,
             };
         }
     }
 }
 
-// ── Publish ────────────────────────────────────────────────────────────────
-
-async fn publish_review(
-    app: &mut App,
-    event_tx: &mpsc::UnboundedSender<AppEvent>,
-    config: &config::AppConfig,
-) {
-    use review::models::ReviewEvent;
-
-    let draft = match &mut app.draft {
-        Some(d) => d,
-        None => {
-            app.show_error("No review draft to publish.");
-            return;
-        }
-    };
-
-    // Sync the selected review event from the radio selector
-    let selected_event = match app.summary_event_idx {
-        0 => ReviewEvent::Comment,
-        1 => ReviewEvent::RequestChanges,
-        _ => ReviewEvent::Approve,
-    };
-    draft.review_event = selected_event;
-
-    // Clone what we need before spawning
-    let draft_clone = draft.clone();
+async fn publish_review(app: &mut App, event_tx: &mpsc::UnboundedSender<AppEvent>, config: &config::AppConfig) {
+    let draft = match &app.draft { Some(d) => d.clone(), None => return };
     let tx = event_tx.clone();
     let cfg = config.clone();
-
-    app.set_status("Publishing review…");
-
     tokio::spawn(async move {
-        let result = async {
-            let api = make_github_api(&cfg)?;
-            let publisher = review::publisher::ReviewPublisher::new(api);
-            publisher.publish(&draft_clone).await
-        }
-        .await;
-
-        match result {
-            Ok(()) => {
-                let _ = tx.send(AppEvent::PublishDone);
-            }
-            Err(e) => {
-                let _ = tx.send(AppEvent::PublishFailed(format!("{:#}", e)));
-            }
+        let api = make_github_api(&cfg).await.unwrap();
+        let publisher = review::publisher::ReviewPublisher::new(api);
+        match publisher.publish(&draft).await {
+            Ok(_) => { let _ = tx.send(AppEvent::PublishDone); }
+            Err(e) => { let _ = tx.send(AppEvent::PublishFailed(e.to_string())); }
         }
     });
 }
 
-// ── Claude Code AI-fix (per-comment task list) ──────────────────────────────
-
-/// Build fix tasks — one per non-rejected review comment — and start processing.
-fn start_fix_tasks(
-    app: &mut App,
-    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
-    config: &config::AppConfig,
-) {
-    use review::models::{CommentSource, CommentStatus};
-
-    let pr = app.current_pr.as_ref();
-    let pr_num = pr.map(|p| p.number).unwrap_or(0);
-    let pr_title = pr.map(|p| p.title.clone()).unwrap_or_else(|| "Unknown PR".to_string());
-
-    let Some(draft) = &app.draft else { return };
-
-    let tasks: Vec<app::FixTask> = draft.comments.iter()
-        .filter(|c| c.status != CommentStatus::Rejected)
-        .enumerate()
-        .map(|(i, comment)| {
-            let source = match &comment.source {
-                CommentSource::Agent { agent_name, .. } => agent_name.clone(),
-                CommentSource::Manual => "Manual".to_string(),
-            };
-            let location = match (&comment.file_path, comment.line) {
-                (Some(f), Some(l)) => format!("{f}:{l}"),
-                (Some(f), None)    => f.clone(),
-                _                  => "(general)".to_string(),
-            };
-            let body = comment.effective_body();
-            let summary = body.lines().next().unwrap_or("").chars().take(60).collect();
-
-            let prompt = format!(
-                "You are a code-review assistant. Apply the following single review comment to \
-                 the codebase. Show the exact file path, line numbers, and the corrected code.\n\n\
-                 ## PR #{pr_num}: {pr_title}\n\n\
-                 ### [{:?}] @ {location}\nSource: {source}\n\n{body}\n\n\
-                 Provide:\n\
-                 1. The exact file and line(s) to change\n\
-                 2. The corrected code\n\
-                 3. A brief explanation of the fix",
-                comment.severity
-            );
-
-            app::FixTask {
-                index: i + 1,
-                location,
-                source,
-                summary,
-                status: app::FixTaskStatus::Pending,
-                output: String::new(),
-                prompt,
-            }
-        })
-        .collect();
-
-    if tasks.is_empty() {
-        return;
-    }
-
-    app.fix_tasks = tasks;
-    app.fix_task_selected = 0;
-    app.claude_output_scroll = 0;
-    app.claude_output_loading = true;
-    app.navigate_to(Screen::ClaudeCodeOutput);
-
-    advance_fix_tasks(app, tx, config);
-}
-
-/// Start the next pending fix task, or mark loading done if all tasks are finished.
-fn advance_fix_tasks(
-    app: &mut App,
-    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
-    config: &config::AppConfig,
-) {
-    let idx = app.fix_tasks.iter().position(|t| t.status == app::FixTaskStatus::Pending);
-    if let Some(idx) = idx {
-        app.fix_tasks[idx].status = app::FixTaskStatus::Running;
-        app.fix_task_selected = idx;
-        app.claude_output_scroll = 0;
-        let prompt = app.fix_tasks[idx].prompt.clone();
-        spawn_single_fix_task(idx, prompt, tx, config);
+fn save_agent_to_disk(app: &App) -> Result<std::path::PathBuf> {
+    // Use the configured agents_dir (expand leading ~)
+    let agents_dir_str = &app.config.agents.agents_dir;
+    let agents_dir = if agents_dir_str.starts_with('~') {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(home).join(&agents_dir_str[2..])
     } else {
-        app.claude_output_loading = false;
-    }
-}
-
-/// Mark the selected failed task as Pending and re-run it.
-fn retry_selected_fix_task(
-    app: &mut App,
-    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
-    config: &config::AppConfig,
-) {
-    let idx = app.fix_task_selected;
-    if let Some(task) = app.fix_tasks.get_mut(idx) {
-        if matches!(task.status, app::FixTaskStatus::Failed(_)) {
-            task.status = app::FixTaskStatus::Pending;
-            task.output.clear();
-        } else {
-            return; // nothing to retry
-        }
-    }
-    app.claude_output_loading = true;
-    advance_fix_tasks(app, tx, config);
-}
-
-/// Spawn Claude for a single fix task and stream its output back via events.
-fn spawn_single_fix_task(
-    task_idx: usize,
-    prompt: String,
-    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
-    config: &config::AppConfig,
-) {
-    let tx = tx.clone();
-    let llm = config.llm.clone();
-    let timeout = config.agents.timeout_secs;
-
-    tokio::spawn(async move {
-        let system = "You are a senior software engineer applying a single code review comment. \
-            Be precise about file paths and line numbers. Show the corrected code.";
-
-        let is_cli = matches!(llm.provider.as_str(), "claude-cli" | "claude");
-
-        if is_cli {
-            match stream_claude_cli_task(task_idx, system, &prompt, timeout, &tx).await {
-                Ok(()) => { let _ = tx.send(tui::event::AppEvent::FixTaskDone(task_idx)); }
-                Err(e) => { let _ = tx.send(tui::event::AppEvent::FixTaskFailed(task_idx, format!("{:#}", e))); }
-            }
-        } else {
-            let client = reqwest::Client::new();
-            let label = format!("fix-task-{}", task_idx + 1);
-            let result = agents::runner::call_provider(
-                &client,
-                &llm,
-                &llm.model.clone(),
-                llm.temperature,
-                llm.max_tokens,
-                system,
-                &prompt,
-                timeout,
-                &label,
-            )
-            .await;
-
-            match result {
-                Ok(text) => {
-                    let _ = tx.send(tui::event::AppEvent::FixTaskChunk(task_idx, text));
-                    let _ = tx.send(tui::event::AppEvent::FixTaskDone(task_idx));
-                }
-                Err(e) => {
-                    let _ = tx.send(tui::event::AppEvent::FixTaskFailed(task_idx, format!("{:#}", e)));
-                }
-            }
-        }
-    });
-}
-
-/// Stream the `claude --print` subprocess line-by-line, tagging each chunk with `task_idx`.
-async fn stream_claude_cli_task(
-    task_idx: usize,
-    system: &str,
-    prompt: &str,
-    timeout_secs: u64,
-    tx: &tokio::sync::mpsc::UnboundedSender<tui::event::AppEvent>,
-) -> anyhow::Result<()> {
-    use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::process::Command;
-
-    let mut child = Command::new("claude")
-        .arg("--print")
-        .arg("--system-prompt")
-        .arg(system)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn `claude`: {} — is Claude Code installed and in PATH?", e))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let bytes = prompt.as_bytes().to_vec();
-        tokio::spawn(async move { let _ = stdin.write_all(&bytes).await; });
-    }
-
-    let stdout = child.stdout.take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to capture claude stdout"))?;
-    let mut reader = BufReader::new(stdout).lines();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            child.kill().await.ok();
-            anyhow::bail!("fix-task-{} timed out after {}s — increase agents.timeout_secs in config",
-                task_idx + 1, timeout_secs);
-        }
-
-        match tokio::time::timeout(remaining, reader.next_line()).await {
-            Ok(Ok(Some(line))) => {
-                if tx.send(tui::event::AppEvent::FixTaskChunk(task_idx, format!("{line}\n"))).is_err() {
-                    break;
-                }
-            }
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                child.kill().await.ok();
-                anyhow::bail!("fix-task-{} timed out after {}s — increase agents.timeout_secs in config",
-                    task_idx + 1, timeout_secs);
-            }
-        }
-    }
-
-    child.wait().await.ok();
-    Ok(())
-}
-
-// ── GitHub API calls ───────────────────────────────────────────────────────
-
-fn make_github_api(config: &config::AppConfig) -> anyhow::Result<github::api::GitHubApi> {
-    let client = github::client::GitHubClient::new(
-        &config.github.token,
-        &config.github.owner,
-        &config.github.repo,
-    )?;
-    Ok(github::api::GitHubApi::new(client))
-}
-
-async fn load_pr_list(config: &config::AppConfig) -> anyhow::Result<Vec<github::models::PrSummary>> {
-    let api = make_github_api(config)?;
-    api.list_prs(config.github.per_page).await
-}
-
-async fn load_pr_details(
-    config: &config::AppConfig,
-    pr_num: u64,
-) -> anyhow::Result<github::models::PrDetails> {
-    let api = make_github_api(config)?;
-    api.get_pr_details(pr_num).await
-}
-
-async fn load_pr_diff(
-    config: &config::AppConfig,
-    pr_num: u64,
-) -> anyhow::Result<String> {
-    let api = make_github_api(config)?;
-    api.get_pr_diff(pr_num).await
-}
-
-/// Extract ticket keys from the PR text and resolve the first match.
-/// Returns `None` silently on any error — ticket is always optional.
-async fn load_ticket_for_pr(
-    config: &config::AppConfig,
-    pr_text: &str,
-) -> Option<tickets::models::Ticket> {
-    let providers = tickets::build_providers(config);
-    if providers.is_empty() || pr_text.is_empty() {
-        return None;
-    }
-
-    let keys = tickets::extractor::extract_ticket_keys(pr_text, &providers);
-    if keys.is_empty() {
-        return None;
-    }
-
-    tickets::extractor::resolve_ticket(&keys, &providers).await
-}
-
-// ── Quick comment publish ──────────────────────────────────────────────────
-
-async fn publish_quick_comment(
-    app: &mut App,
-    event_tx: &mpsc::UnboundedSender<AppEvent>,
-    config: &config::AppConfig,
-    text: String,
-) {
-    let pr_num = match app.current_pr.as_ref().map(|p| p.number) {
-        Some(n) => n,
-        None => {
-            app.show_error("No PR loaded.");
-            return;
-        }
+        std::path::PathBuf::from(agents_dir_str)
     };
+    std::fs::create_dir_all(&agents_dir)?;
+    let file_path = agents_dir.join(format!("{}.md", app.wizard_id));
 
-    // If auto-translate is enabled and LLM available, translate first
-    let final_text = if config.publishing.auto_translate_to_english && config.is_llm_configured() {
-        app.set_status("Translating to English…");
-        match translate_to_english(&text, config).await {
-            Ok(translated) => translated,
-            Err(_) => text, // fall back to original on error
-        }
-    } else if config.publishing.auto_correct_grammar && config.is_llm_configured() {
-        app.set_status("Correcting grammar…");
-        match correct_grammar(&text, config).await {
-            Ok(corrected) => corrected,
-            Err(_) => text,
-        }
-    } else {
-        text
-    };
+    let prompt_text = app.wizard_prompt_editor.get_text();
+    let prompt_suffix = "Please respond with a JSON array where each element has: \
+        file_path (string or null), line (number or null), \
+        severity (\"critical\"|\"warning\"|\"suggestion\"|\"praise\"), and body (string).";
 
-    let tx = event_tx.clone();
-    let cfg = config.clone();
-    app.set_status("Publishing comment…");
-    tokio::spawn(async move {
-        let result = async {
-            let api = make_github_api(&cfg)?;
-            api.post_pr_comment(pr_num, &final_text).await
-        }.await;
-        match result {
-            Ok(()) => { let _ = tx.send(AppEvent::QuickCommentDone); }
-            Err(e) => { let _ = tx.send(AppEvent::QuickCommentFailed(format!("{:#}", e))); }
-        }
-    });
+    let content = format!(
+        "---\n\
+        id: {id}\n\
+        name: {name}\n\
+        description: Custom agent\n\
+        enabled: true\n\
+        order: 99\n\
+        icon: \"{icon}\"\n\
+        color: cyan\n\
+        synthesis: false\n\
+        context:\n\
+        \x20 include_diff: true\n\
+        \x20 include_pr_description: true\n\
+        \x20 include_ticket: false\n\
+        \x20 include_file_list: false\n\
+        \x20 exclude_patterns: []\n\
+        \x20 include_patterns: []\n\
+        ---\n\n\
+        ## System Prompt\n\n\
+        {prompt}\n\n\
+        ## Prompt Suffix\n\n\
+        {suffix}\n",
+        id = app.wizard_id,
+        name = app.wizard_name,
+        icon = app.wizard_icon,
+        prompt = prompt_text,
+        suffix = prompt_suffix,
+    );
+    std::fs::write(&file_path, content)?;
+    Ok(file_path)
 }
-
-async fn translate_to_english(text: &str, config: &config::AppConfig) -> anyhow::Result<String> {
-    call_llm_for_text(
-        "You are a technical writing assistant. Translate the following text to English. Return ONLY the translated text, nothing else.",
-        text,
-        config,
-    ).await
-}
-
-async fn correct_grammar(text: &str, config: &config::AppConfig) -> anyhow::Result<String> {
-    call_llm_for_text(
-        "You are a technical writing assistant. Correct the grammar and spelling of the following text while preserving its meaning and technical terminology. Keep code blocks unchanged. Return ONLY the corrected text, nothing else.",
-        text,
-        config,
-    ).await
-}
-
-async fn call_llm_for_text(system: &str, text: &str, config: &config::AppConfig) -> anyhow::Result<String> {
-    use anyhow::Context;
-    use tokio::io::AsyncWriteExt;
-    use tokio::process::Command;
-    use std::process::Stdio;
-
-    let timeout_secs = config.agents.timeout_secs;
-    let mut child = Command::new("claude")
-        .arg("--print")
-        .arg("--system-prompt")
-        .arg(system)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn claude")?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes()).await?;
-    }
-
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("LLM translation timed out"))??;
-
-    if !output.status.success() {
-        anyhow::bail!("claude exited with error");
-    }
-
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
-}
-
-// ── Tracing init ───────────────────────────────────────────────────────────
 
 fn init_tracing() -> Option<()> {
-    // Write logs to a file if PRISM_LOG_FILE is set, otherwise discard
-    if let Ok(log_file) = std::env::var("PRISM_LOG_FILE") {
-        if let Ok(file) = std::fs::File::create(&log_file) {
-            tracing_subscriber::fmt()
-                .with_writer(std::sync::Mutex::new(file))
-                .with_env_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new("prism=info")),
-                )
-                .init();
-            return Some(());
-        }
+    if let Ok(file) = std::fs::File::create("prism.log") {
+        tracing_subscriber::fmt().with_writer(std::sync::Mutex::new(file)).with_env_filter(EnvFilter::new("prism=info")).init();
     }
-    // No log output when running TUI (avoids corrupting the screen)
     Some(())
 }
