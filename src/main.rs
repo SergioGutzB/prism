@@ -178,14 +178,52 @@ async fn main() -> Result<()> {
                         }
                         if app.should_quit { break; }
                     }
-                    AppEvent::PrListLoaded(prs) => { app.pr_list = prs; app.pr_list_loading = false; }
+                    AppEvent::PrListLoaded(prs) => {
+                        // Prune drafts (and cache) for PRs that are no longer open
+                        let open_nums: Vec<u64> = prs.iter().map(|p| p.number).collect();
+                        let repo_slug = format!("{}/{}", config.github.owner, config.github.repo);
+                        review::cache::prune_closed(&repo_slug, &open_nums);
+                        prune_closed_drafts(&repo_slug, &open_nums);
+                        app.pr_list = prs;
+                        app.pr_list_loading = false;
+                    }
                     AppEvent::PrLoaded(pr) => { app.current_pr = Some(*pr); app.pr_loading = false; }
                     AppEvent::DiffLoaded(diff) => {
                         app.diff_lines_cache = Some(diff.lines().map(str::to_string).collect());
                         app.current_diff = Some(diff);
                         app.diff_loading = false;
+                        app.diff_cursor = 0;
+                        app.diff_scroll = 0;
+                        // Ensure a draft exists (handles race where DiffLoaded arrives before ReviewsLoaded)
+                        if app.draft.is_none() {
+                            let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
+                            if pr_num > 0 {
+                                app.draft = Some(review::models::ReviewDraft::new(pr_num, review::models::ReviewMode::ManualOnly));
+                            }
+                        }
                         if let (Some(draft), Some(d)) = (&mut app.draft, &app.current_diff.clone()) {
                             populate_checklist_from_diff(draft, d);
+                        }
+                        // Restore the persisted draft (all comments + checklist state).
+                        // Merge: keep the file checklist from the diff (always fresh), but
+                        // restore comments and checked flags from disk.
+                        let repo_slug = format!("{}/{}", config.github.owner, config.github.repo);
+                        if let Some(pr_num) = app.draft.as_ref().map(|d| d.pr_number) {
+                            if let Some(saved) = review::draft_store::load(pr_num, &repo_slug) {
+                                if let Some(draft) = &mut app.draft {
+                                    // Restore comments from disk
+                                    draft.comments = saved.comments;
+                                    draft.review_body = saved.review_body;
+                                    draft.review_event = saved.review_event;
+                                    draft.mode = saved.mode;
+                                    // Restore check marks for files that still exist in the diff
+                                    for (path, checked) in &saved.file_checklist {
+                                        if let Some(entry) = draft.file_checklist.get_mut(path) {
+                                            *entry = *checked;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     AppEvent::ConfigReloaded(cfg, agents) => {
@@ -194,32 +232,42 @@ async fn main() -> Result<()> {
                         app.set_status("Config reloaded.");
                     }
                     AppEvent::Error(msg) => { app.show_error(msg); }
-                    AppEvent::AgentUpdate(update) => { handle_agent_update(&mut app, update); }
+                    AppEvent::AgentUpdate(update) => { handle_agent_update(&mut app, update, &config); }
                     AppEvent::UserLoaded(login) => { app.github_user = Some(login); }
-                    AppEvent::ReviewsLoaded(reviews, comments) => {
-                        if reviews.is_empty() && comments.is_empty() { /* nothing to merge */ }
-                        else {
-                            let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
-                            if pr_num > 0 {
-                                let draft = app.draft.get_or_insert_with(|| {
-                                    review::models::ReviewDraft::new(pr_num, review::models::ReviewMode::ManualOnly)
-                                });
+                    AppEvent::ReviewsLoaded(for_pr_num, reviews, comments) => {
+                        // Discard if the user has already switched to a different PR
+                        let current_num = app.current_pr.as_ref().map(|p| p.number);
+                        let matches = current_num == Some(for_pr_num)
+                            || (current_num.is_none() && app.pr_loading);
+                        if matches && (!reviews.is_empty() || !comments.is_empty()) {
+                            let draft = app.draft.get_or_insert_with(|| {
+                                review::models::ReviewDraft::new(for_pr_num, review::models::ReviewMode::ManualOnly)
+                            });
+                            // Only merge if the draft belongs to this PR
+                            if draft.pr_number == for_pr_num || draft.pr_number == 0 {
+                                draft.pr_number = for_pr_num;
                                 draft.merge_github_reviews(reviews, comments);
-                                // populate file checklist if diff is available
                                 if let Some(diff) = &app.current_diff.clone() {
                                     populate_checklist_from_diff(draft, diff);
                                 }
                             }
+                            save_draft(&app, &config);
                         }
                     }
                     AppEvent::PublishDone => {
+                        // Delete the draft — it has been submitted to GitHub
+                        if let Some(draft) = &app.draft {
+                            let repo_slug = format!("{}/{}", config.github.owner, config.github.repo);
+                            review::draft_store::delete(draft.pr_number, &repo_slug);
+                        }
+                        app.draft = None;
                         app.set_status("Review published successfully!");
                         app.navigate_to(Screen::PrList);
                     }
                     AppEvent::PublishFailed(e) => { app.show_error(format!("Publish failed: {e}")); }
                     AppEvent::CommentDeleted(_id) => {
-                        // Comment was already removed locally on confirm; just show status
                         app.set_status("Comment deleted from GitHub.");
+                        save_draft(&app, &config);
                     }
                     AppEvent::CommentUpdated(id, new_body) => {
                         if let Some(draft) = &mut app.draft {
@@ -229,6 +277,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         app.set_status("Comment updated on GitHub.");
+                        save_draft(&app, &config);
                     }
                     _ => {}
                 }
@@ -241,7 +290,7 @@ async fn main() -> Result<()> {
                 }
             } => {
                 match agent_update {
-                    Some(update) => handle_agent_update(&mut app, update),
+                    Some(update) => handle_agent_update(&mut app, update, &config),
                     None => { app.agent_rx = None; } // channel closed
                 }
             }
@@ -324,6 +373,11 @@ async fn handle_action(app: &mut App, action: Action, event_tx: &mpsc::Unbounded
                     }
                 }
                 PopupKind::ConfirmRestart => {
+                    // Delete persisted draft so a fresh run starts clean
+                    if let Some(pr_num) = app.current_pr.as_ref().map(|p| p.number) {
+                        let repo_slug = format!("{}/{}", config.github.owner, config.github.repo);
+                        review::draft_store::delete(pr_num, &repo_slug);
+                    }
                     app.draft = None;
                     start_agent_runner(app, config);
                 }
@@ -410,11 +464,17 @@ async fn handle_action(app: &mut App, action: Action, event_tx: &mpsc::Unbounded
         // Navigation
         Action::NavDown => match app.screen {
             Screen::PrList => app.nav_down(),
-            Screen::PrDetail => match app.selected_pane {
-                0 => app.description_scroll += 1,
-                1 => app.diff_scroll += 1,
-                _ => {}
-            },
+            Screen::PrDetail => {
+                // j/k always drives the diff cursor regardless of selected pane
+                let total = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
+                if total > 0 && app.diff_cursor + 1 < total {
+                    app.diff_cursor += 1;
+                    let vh = app.diff_viewport_height.max(1);
+                    if app.diff_cursor >= app.diff_scroll + vh {
+                        app.diff_scroll = app.diff_cursor.saturating_sub(vh - 1);
+                    }
+                }
+            }
             Screen::DoubleCheck => {
                 if app.double_check_pane == 0 {
                     let total = ui::screens::double_check::visible_comment_count(app);
@@ -434,11 +494,15 @@ async fn handle_action(app: &mut App, action: Action, event_tx: &mpsc::Unbounded
         },
         Action::NavUp => match app.screen {
             Screen::PrList => app.nav_up(),
-            Screen::PrDetail => match app.selected_pane {
-                0 => app.description_scroll = app.description_scroll.saturating_sub(1),
-                1 => app.diff_scroll = app.diff_scroll.saturating_sub(1),
-                _ => {}
-            },
+            Screen::PrDetail => {
+                // j/k always drives the diff cursor regardless of selected pane
+                if app.diff_cursor > 0 {
+                    app.diff_cursor -= 1;
+                    if app.diff_cursor < app.diff_scroll {
+                        app.diff_scroll = app.diff_cursor;
+                    }
+                }
+            }
             Screen::DoubleCheck => {
                 if app.double_check_pane == 0 { app.double_check_selected = app.double_check_selected.saturating_sub(1); }
                 else { app.double_check_detail_scroll = app.double_check_detail_scroll.saturating_sub(1); }
@@ -531,6 +595,17 @@ async fn handle_action(app: &mut App, action: Action, event_tx: &mpsc::Unbounded
                 app.compose_quick_mode = false;
                 app.compose_editor = crate::ui::editor::PrismEditor::new(String::new());
                 app.editing_comment_id = None;
+                // When in the diff pane, pre-fill file/line from cursor position
+                if app.screen == Screen::PrDetail && app.selected_pane == 1 {
+                    if let Some(lines) = &app.diff_lines_cache {
+                        let (file, line) = diff_cursor_location(lines, app.diff_cursor);
+                        app.compose_file_path = file;
+                        app.compose_line = line;
+                    }
+                } else {
+                    app.compose_file_path = None;
+                    app.compose_line = None;
+                }
                 app.navigate_to(Screen::ReviewCompose);
             } else if app.screen == Screen::DoubleCheck {
                 // [c] on DoubleCheck opens new comment (not edit)
@@ -631,6 +706,7 @@ async fn handle_action(app: &mut App, action: Action, event_tx: &mpsc::Unbounded
             Screen::PrList => { open_pr(app, event_tx, config).await; }
             Screen::ReviewCompose => {
                 save_or_update_comment(app, event_tx, config).await;
+                save_draft(app, config);
                 app.navigate_back();
             }
             Screen::AgentWizard => {
@@ -645,8 +721,10 @@ async fn handle_action(app: &mut App, action: Action, event_tx: &mpsc::Unbounded
         }
 
         Action::ToggleItem => {
-            if app.screen == Screen::DoubleCheck { toggle_comment(app); }
-            else if app.screen == Screen::AgentConfig {
+            if app.screen == Screen::DoubleCheck {
+                toggle_comment(app);
+                save_draft(app, config);
+            } else if app.screen == Screen::AgentConfig {
                 if let Some(agent) = app.agents.get_mut(app.agent_config_selected) {
                     agent.agent.enabled = !agent.agent.enabled;
                 }
@@ -692,6 +770,7 @@ async fn handle_action(app: &mut App, action: Action, event_tx: &mpsc::Unbounded
                         *checked = !*checked;
                     }
                 }
+                save_draft(app, config);
             }
         }
 
@@ -704,6 +783,87 @@ async fn handle_action(app: &mut App, action: Action, event_tx: &mpsc::Unbounded
             }
         }
 
+        Action::ScrollDown => {
+            if app.screen == Screen::PrDetail {
+                let total = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
+                let step = (app.diff_viewport_height / 2).max(1);
+                app.diff_cursor = (app.diff_cursor + step).min(total.saturating_sub(1));
+                let vh = app.diff_viewport_height.max(1);
+                if app.diff_cursor >= app.diff_scroll + vh {
+                    app.diff_scroll = app.diff_cursor.saturating_sub(vh - 1);
+                }
+            }
+        }
+        Action::ScrollUp => {
+            if app.screen == Screen::PrDetail {
+                let step = (app.diff_viewport_height / 2).max(1);
+                app.diff_cursor = app.diff_cursor.saturating_sub(step);
+                if app.diff_cursor < app.diff_scroll {
+                    app.diff_scroll = app.diff_cursor;
+                }
+            }
+        }
+        Action::PageDown => {
+            if app.screen == Screen::PrDetail {
+                let total = app.diff_lines_cache.as_ref().map(|l| l.len()).unwrap_or(0);
+                let step = app.diff_viewport_height.saturating_sub(1).max(1);
+                app.diff_cursor = (app.diff_cursor + step).min(total.saturating_sub(1));
+                let vh = app.diff_viewport_height.max(1);
+                if app.diff_cursor >= app.diff_scroll + vh {
+                    app.diff_scroll = app.diff_cursor.saturating_sub(vh - 1);
+                }
+            }
+        }
+        Action::PageUp => {
+            if app.screen == Screen::PrDetail {
+                let step = app.diff_viewport_height.saturating_sub(1).max(1);
+                app.diff_cursor = app.diff_cursor.saturating_sub(step);
+                if app.diff_cursor < app.diff_scroll {
+                    app.diff_scroll = app.diff_cursor;
+                }
+            }
+        }
+        Action::Refresh => {
+            match app.screen {
+                Screen::PrList => {
+                    app.set_status("Refreshing PR list…");
+                    app.pr_list_loading = true;
+                    let tx = event_tx.clone();
+                    let cfg = config.clone();
+                    tokio::spawn(async move {
+                        match load_pr_list(&cfg).await {
+                            Ok(prs) => { let _ = tx.send(AppEvent::PrListLoaded(prs)); }
+                            Err(e) => { let _ = tx.send(AppEvent::Error(format!("Refresh failed: {e}"))); }
+                        }
+                    });
+                }
+                Screen::PrDetail => {
+                    if let Some(pr_num) = app.current_pr.as_ref().map(|p| p.number) {
+                        app.set_status("Refreshing PR…");
+                        app.diff_loading = true;
+                        // Reload diff + reviews
+                        let tx = event_tx.clone();
+                        let cfg = config.clone();
+                        tokio::spawn(async move {
+                            match load_pr_diff(&cfg, pr_num).await {
+                                Ok(diff) => { let _ = tx.send(AppEvent::DiffLoaded(diff)); }
+                                Err(e) => { let _ = tx.send(AppEvent::Error(format!("Refresh failed: {e}"))); }
+                            }
+                        });
+                        let tx = event_tx.clone();
+                        let cfg = config.clone();
+                        tokio::spawn(async move {
+                            if let Ok(api) = make_github_api(&cfg).await {
+                                let reviews = api.list_reviews(pr_num).await.unwrap_or_default();
+                                let comments = api.list_inline_comments(pr_num).await.unwrap_or_default();
+                                let _ = tx.send(AppEvent::ReviewsLoaded(pr_num, reviews, comments));
+                            }
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
         Action::ShowStats => { app.show_stats = !app.show_stats; }
         Action::Settings => { app.navigate_to(Screen::Settings); }
         Action::AgentConfig => { app.navigate_to(Screen::AgentConfig); }
@@ -712,6 +872,50 @@ async fn handle_action(app: &mut App, action: Action, event_tx: &mpsc::Unbounded
         Action::OpenBrowser => { if let Some(pr) = &app.current_pr { let _ = std::process::Command::new("xdg-open").arg(&pr.html_url).spawn(); } }
         _ => {}
     }
+}
+
+/// Extract (file_path, new_file_line_number) from a position in the unified diff line cache.
+/// Used to pre-fill the file/line when opening a manual comment from the diff pane.
+fn diff_cursor_location(lines: &[String], cursor: usize) -> (Option<String>, Option<u32>) {
+    let mut file: Option<String> = None;
+    let mut new_line: u32 = 1;
+
+    for (i, raw) in lines.iter().enumerate() {
+        if raw.starts_with("+++ ") {
+            let path = raw
+                .trim_start_matches("+++ b/")
+                .trim_start_matches("+++ a/")
+                .trim_start_matches("+++ ");
+            file = Some(path.to_string());
+            new_line = 1;
+        } else if raw.starts_with("@@") {
+            if let Some(after) = raw.strip_prefix("@@ -") {
+                if let Some((_old, rest)) = after.split_once(' ') {
+                    if let Some(new_part) = rest.strip_prefix('+') {
+                        let new_start: u32 = new_part
+                            .split_whitespace().next().unwrap_or("1")
+                            .split(',').next()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(1);
+                        new_line = new_start;
+                    }
+                }
+            }
+            if i == cursor { return (file, None); }
+        } else if raw.starts_with('+') {
+            if i == cursor { return (file, Some(new_line)); }
+            new_line += 1;
+        } else if raw.starts_with('-') {
+            if i == cursor { return (file, Some(new_line)); }
+            // removed line: don't advance new_line
+        } else if raw.starts_with(' ') {
+            if i == cursor { return (file, Some(new_line)); }
+            new_line += 1;
+        } else if i == cursor {
+            return (file, None);
+        }
+    }
+    (file, None)
 }
 
 fn has_existing_review(app: &App) -> bool {
@@ -736,7 +940,18 @@ fn populate_checklist_from_diff(draft: &mut review::models::ReviewDraft, diff: &
     }
 }
 
-fn handle_agent_update(app: &mut App, update: agents::orchestrator::AgentUpdate) {
+fn save_draft(app: &App, config: &config::AppConfig) {
+    if let Some(draft) = &app.draft {
+        let repo_slug = format!("{}/{}", config.github.owner, config.github.repo);
+        review::draft_store::save(draft, &repo_slug);
+    }
+}
+
+fn prune_closed_drafts(repo_slug: &str, open_numbers: &[u64]) {
+    review::draft_store::prune_closed(repo_slug, open_numbers);
+}
+
+fn handle_agent_update(app: &mut App, update: agents::orchestrator::AgentUpdate, config: &config::AppConfig) {
     use agents::models::AgentStatus;
     if let AgentStatus::Done { input_tokens, output_tokens, .. } = &update.status {
         let model = app.config.llm.model.clone();
@@ -769,6 +984,7 @@ fn handle_agent_update(app: &mut App, update: agents::orchestrator::AgentUpdate)
                     }
                 }
             }
+            save_draft(app, config);
             app.navigate_to(Screen::DoubleCheck);
         }
     }
@@ -803,7 +1019,31 @@ async fn load_pr_diff(config: &config::AppConfig, pr_num: u64) -> Result<String>
 
 async fn open_pr(app: &mut App, event_tx: &mpsc::UnboundedSender<AppEvent>, config: &config::AppConfig) {
     let pr_num = match app.selected_pr() { Some(pr) => pr.number, None => return };
-    app.pr_loading = true; app.diff_loading = true;
+
+    // Clear all state from the previously viewed PR before loading the new one
+    app.current_pr = None;
+    app.current_diff = None;
+    app.diff_lines_cache = None;
+    app.diff_line_ext = Vec::new();
+    // Pre-create a blank draft so the file checklist is populated when the diff arrives,
+    // even for clean PRs that have no GitHub reviews/comments.
+    app.draft = Some(review::models::ReviewDraft::new(pr_num, review::models::ReviewMode::ManualOnly));
+    app.agent_statuses.clear();
+    app.diff_scroll = 0;
+    app.diff_cursor = 0;
+    app.description_scroll = 0;
+    app.compose_file_path = None;
+    app.compose_line = None;
+    app.compose_context = Vec::new();
+    app.current_ticket = None;
+    app.file_tree_line = 0;
+    app.file_tree_pane = 0;
+    app.file_tree_scroll = 0;
+    app.file_tree_fullscreen = false;
+    app.file_tree_split = false;
+
+    app.pr_loading = true;
+    app.diff_loading = true;
     app.navigate_to(Screen::PrDetail);
 
     let tx = event_tx.clone();
@@ -824,14 +1064,14 @@ async fn open_pr(app: &mut App, event_tx: &mpsc::UnboundedSender<AppEvent>, conf
         }
     });
 
-    // Load existing reviews and inline comments
+    // Load existing reviews and inline comments — carries pr_num so stale results can be discarded
     let tx = event_tx.clone();
     let cfg = config.clone();
     tokio::spawn(async move {
         if let Ok(api) = make_github_api(&cfg).await {
             let reviews = api.list_reviews(pr_num).await.unwrap_or_default();
             let comments = api.list_inline_comments(pr_num).await.unwrap_or_default();
-            let _ = tx.send(AppEvent::ReviewsLoaded(reviews, comments));
+            let _ = tx.send(AppEvent::ReviewsLoaded(pr_num, reviews, comments));
         }
     });
 }

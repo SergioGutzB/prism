@@ -1,9 +1,9 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState};
 
 use crate::app::App;
 use crate::review::models::{CommentSource, CommentStatus, Severity};
-use crate::ui::components::{diff_view, keybind_bar, syntax};
+use crate::ui::components::{diff_view, keybind_bar};
 use crate::ui::theme::Theme;
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -94,7 +94,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .title(title.as_str())
         .title_style(Style::default().fg(t.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border_focused))
+        .border_style(Style::default().fg(t.title))
         .style(Style::default().bg(t.background));
     frame.render_widget(block, area);
 }
@@ -163,7 +163,7 @@ fn render_table(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(t.border_focused)),
+            .border_style(Style::default().fg(if app.file_tree_pane == 0 { t.border_focused } else { t.border })),
     );
 
     let mut state = TableState::default();
@@ -223,96 +223,33 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     .split(area);
 
     let diff_lines = extract_file_diff_lines(app, path);
-    let scroll = app.file_tree_scroll;
+    let cursor = Some(app.file_tree_scroll);
     let focused = app.file_tree_pane == 1;
 
-    // In fullscreen mode delegate to the shared diff_view renderers
-    if app.file_tree_fullscreen {
-        if app.file_tree_split {
-            diff_view::render_split_lines(
-                frame,
-                detail_chunks[0],
-                &diff_lines,
-                scroll,
-                path,
-                None,
-                t,
-                focused,
-            );
-        } else {
-            diff_view::render_unified_lines(
-                frame,
-                detail_chunks[0],
-                &diff_lines,
-                scroll,
-                path,
-                None,
-                t,
-                focused,
-            );
-        }
+    // Split mode (fullscreen only) uses the side-by-side renderer
+    if app.file_tree_fullscreen && app.file_tree_split {
+        diff_view::render_split_lines(
+            frame,
+            detail_chunks[0],
+            &diff_lines,
+            cursor,
+            path,
+            None,
+            t,
+            focused,
+        );
     } else {
-        // Non-fullscreen: use the existing inline renderer
-        let total = diff_lines.len();
-        let ext = path.rsplit('.').next();
-        let effective_scroll = scroll.min(total.saturating_sub(1));
-
-        let border_color = if focused { t.border_focused } else { t.border };
-        let block = Block::default()
-            .title(format!(" {} ", path))
-            .title_style(Style::default().fg(t.title))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color))
-            .style(Style::default().bg(t.background));
-
-        let inner = block.inner(detail_chunks[0]);
-        frame.render_widget(block, detail_chunks[0]);
-
-        if total == 0 {
-            frame.render_widget(
-                Paragraph::new("  No diff available for this file.")
-                    .style(Style::default().fg(t.muted)),
-                inner,
-            );
-        } else {
-            let visible: Vec<Line> = diff_lines
-                .iter()
-                .skip(effective_scroll)
-                .take(inner.height as usize)
-                .map(|raw| colorize_diff_line_with_syntax(raw, ext, t))
-                .collect();
-            frame.render_widget(
-                Paragraph::new(visible).style(Style::default().bg(t.background)),
-                inner,
-            );
-
-            if total > inner.height as usize {
-                let max_s = total.saturating_sub(inner.height as usize);
-                let mut sb_state = ScrollbarState::new(max_s).position(effective_scroll.min(max_s));
-                frame.render_stateful_widget(
-                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                        .begin_symbol(Some("▲"))
-                        .end_symbol(Some("▼"))
-                        .thumb_symbol("█")
-                        .track_symbol(Some("│")),
-                    detail_chunks[0],
-                    &mut sb_state,
-                );
-                let indicator = format!(" {}/{} ", effective_scroll + 1, total);
-                let iw = indicator.len() as u16;
-                let ind_area = Rect {
-                    x: detail_chunks[0].right().saturating_sub(iw + 2),
-                    y: detail_chunks[0].bottom().saturating_sub(1),
-                    width: iw,
-                    height: 1,
-                };
-                frame.render_widget(
-                    Paragraph::new(indicator)
-                        .style(Style::default().fg(t.muted).bg(t.background)),
-                    ind_area,
-                );
-            }
-        }
+        // Both fullscreen-unified and non-fullscreen use render_unified_lines
+        diff_view::render_unified_lines(
+            frame,
+            detail_chunks[0],
+            &diff_lines,
+            cursor,
+            path,
+            None,
+            t,
+            focused,
+        );
     }
 
     // Comments section (hidden in fullscreen)
@@ -411,37 +348,6 @@ fn extract_file_diff_lines(app: &App, path: &str) -> Vec<String> {
     result
 }
 
-fn colorize_diff_line_with_syntax(raw: &str, ext: Option<&str>, t: &Theme) -> Line<'static> {
-    if raw.starts_with("@@") {
-        return Line::from(Span::styled(raw.to_string(), Style::default().fg(t.diff_hunk)));
-    }
-    if raw.starts_with("diff ") || raw.starts_with("index ")
-        || raw.starts_with("---") || raw.starts_with("+++")
-    {
-        return Line::from(Span::styled(raw.to_string(), Style::default().fg(t.title)));
-    }
-    if raw.starts_with('+') {
-        let code = &raw[1..];
-        let bg = Color::Rgb(20, 48, 20);
-        let mut spans = vec![Span::styled("+".to_string(), Style::default().fg(t.diff_add).bg(bg))];
-        spans.extend(syntax::highlight(code, ext, Some(bg)));
-        return Line::from(spans);
-    }
-    if raw.starts_with('-') {
-        let code = &raw[1..];
-        let bg = Color::Rgb(48, 20, 20);
-        let mut spans = vec![Span::styled("-".to_string(), Style::default().fg(t.diff_remove).bg(bg))];
-        spans.extend(syntax::highlight(code, ext, Some(bg)));
-        return Line::from(spans);
-    }
-    if raw.starts_with(' ') {
-        let code = &raw[1..];
-        let mut spans = vec![Span::raw(" ")];
-        spans.extend(syntax::highlight(code, ext, None));
-        return Line::from(spans);
-    }
-    Line::from(Span::styled(raw.to_string(), Style::default().fg(t.diff_context)))
-}
 
 fn shorten_path(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').collect();

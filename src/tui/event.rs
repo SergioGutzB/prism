@@ -26,7 +26,8 @@ pub enum AppEvent {
     SetupSaved(String, String, String),
     SetupFailed(String),
     UserLoaded(String),
-    ReviewsLoaded(Vec<crate::github::models::GhReview>, Vec<crate::github::models::GhPrComment>),
+    /// Carries the PR number so the handler can discard stale results if the user switched PRs.
+    ReviewsLoaded(u64, Vec<crate::github::models::GhReview>, Vec<crate::github::models::GhPrComment>),
     QuickCommentDone,
     QuickCommentFailed(String),
     /// A streaming text chunk from Claude for fix-task at `index`.

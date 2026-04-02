@@ -26,7 +26,7 @@ pub fn render(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border_focused))
+        .border_style(Style::default().fg(t.title))
         .style(Style::default().bg(t.background));
 
     let inner = block.inner(dialog);

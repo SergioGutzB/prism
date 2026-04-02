@@ -60,7 +60,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .title_style(Style::default().fg(t.title).add_modifier(Modifier::BOLD))
         .title_alignment(Alignment::Left)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border_focused))
+        .border_style(Style::default().fg(t.title))
         .style(Style::default().bg(t.background));
 
     let inner = block.inner(area);

@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratedComment {
     pub id: uuid::Uuid,
     /// GitHub comment id — set when imported from GitHub, used for update/delete.
@@ -46,7 +46,7 @@ impl GeneratedComment {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CommentSource {
     Agent {
         agent_id: String,
@@ -115,14 +115,14 @@ impl std::str::FromStr for Severity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CommentStatus {
     Pending,
     Approved,
     Rejected,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReviewEvent {
     Approve,
     Comment,
@@ -139,14 +139,14 @@ impl ReviewEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReviewMode {
     AiOnly,
     ManualOnly,
     Hybrid,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewDraft {
     pub pr_number: u64,
     pub comments: Vec<GeneratedComment>,

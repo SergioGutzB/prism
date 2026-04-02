@@ -56,7 +56,7 @@ impl Theme {
             agent_skipped: Color::DarkGray,
             agent_disabled: Color::DarkGray,
             border: Color::DarkGray,
-            border_focused: Color::Rgb(0, 210, 255),
+            border_focused: Color::Rgb(255, 165, 50),
             title: Color::Cyan,
             label_bg: Color::DarkGray,
             label_fg: Color::White,

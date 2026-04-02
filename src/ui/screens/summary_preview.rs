@@ -76,7 +76,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .title(header_title.as_str())
         .title_style(Style::default().fg(t.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border_focused))
+        .border_style(Style::default().fg(t.title))
         .style(Style::default().bg(t.background));
     frame.render_widget(block, area);
 }
@@ -229,7 +229,7 @@ fn render_event_selector(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .title(" Review Type — [←→] to change ")
         .title_style(Style::default().fg(t.title))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border_focused))
+        .border_style(Style::default().fg(t.title))
         .style(Style::default().bg(t.background));
 
     let inner = block.inner(area);

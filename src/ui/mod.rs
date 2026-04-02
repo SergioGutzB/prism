@@ -67,7 +67,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
         .title(" PRISM \u{2014} Settings ")
         .title_style(Style::default().fg(t.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border_focused))
+        .border_style(Style::default().fg(t.title))
         .style(Style::default().bg(t.background));
     frame.render_widget(header, chunks[0]);
 
