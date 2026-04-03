@@ -421,3 +421,77 @@ pub fn extract_blob_shas(diff: &str) -> HashMap<String, String> {
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_diff(files: &[(&str, &str, &str)]) -> String {
+        // files: (path, old_sha, new_sha)
+        files.iter().map(|(path, old_sha, new_sha)| {
+            format!(
+                "diff --git a/{path} b/{path}\nindex {old_sha}..{new_sha} 100644\n--- a/{path}\n+++ b/{path}\n"
+            )
+        }).collect()
+    }
+
+    #[test]
+    fn extract_blob_shas_single_file() {
+        let diff = make_diff(&[("src/lib.rs", "abc1234", "def5678")]);
+        let shas = extract_blob_shas(&diff);
+        assert_eq!(shas.get("src/lib.rs").map(|s| s.as_str()), Some("def5678"));
+    }
+
+    #[test]
+    fn extract_blob_shas_multiple_files() {
+        let diff = make_diff(&[
+            ("src/a.rs", "aaa0001", "bbb0002"),
+            ("src/b.rs", "ccc0003", "ddd0004"),
+        ]);
+        let shas = extract_blob_shas(&diff);
+        assert_eq!(shas.len(), 2);
+        assert_eq!(shas["src/a.rs"], "bbb0002");
+        assert_eq!(shas["src/b.rs"], "ddd0004");
+    }
+
+    #[test]
+    fn extract_blob_shas_new_file_excluded() {
+        // New file: old SHA is all-zeros — the new SHA is also the object SHA but
+        // the function uses the *new* (right-hand) SHA from "abc..0000000", which
+        // would be all zeros → excluded.
+        let diff = "diff --git a/new.rs b/new.rs\nnew file mode 100644\nindex 0000000..abc1234\n";
+        let shas = extract_blob_shas(&diff);
+        assert_eq!(shas.get("new.rs").map(|s| s.as_str()), Some("abc1234"));
+        // New file new SHA is non-zero → should be present
+    }
+
+    #[test]
+    fn extract_blob_shas_deleted_file_zero_new_sha_excluded() {
+        // Deleted file: new SHA is all-zeros → excluded
+        let diff = "diff --git a/old.rs b/old.rs\ndeleted file mode 100644\nindex abc1234..0000000\n";
+        let shas = extract_blob_shas(&diff);
+        assert!(!shas.contains_key("old.rs"), "all-zero SHA should be excluded");
+    }
+
+    #[test]
+    fn extract_blob_shas_empty_diff() {
+        let shas = extract_blob_shas("");
+        assert!(shas.is_empty());
+    }
+
+    #[test]
+    fn extract_blob_shas_no_index_lines() {
+        let diff = "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n+new line\n";
+        let shas = extract_blob_shas(&diff);
+        // No index line → no SHA recorded
+        assert!(!shas.contains_key("foo.rs"));
+    }
+
+    #[test]
+    fn extract_blob_shas_index_with_file_mode() {
+        // "index abc..def 100644" — extra field after SHA pair should still parse
+        let diff = "diff --git a/main.rs b/main.rs\nindex abc123f..def456a 100644\n";
+        let shas = extract_blob_shas(&diff);
+        assert_eq!(shas.get("main.rs").map(|s| s.as_str()), Some("def456a"));
+    }
+}

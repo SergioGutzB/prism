@@ -53,7 +53,7 @@ Your task is to **synthesise** all of the above into a short, actionable review 
 3. Highlight the most important specialist findings — especially `critical` and `warning`
    items — mentioning their file locations so the reader knows where to look
 4. Call out **cross-cutting patterns** if multiple agents flagged the same area
-   (e.g. *"Both the security and architecture reviewers flagged `src/auth.rs`"*)
+   (e.g. *"Both the security and architecture reviewers flagged `src/auth/middleware`"*)
 5. Give an **overall assessment**: is this PR safe to merge? What needs attention first?
 6. Keep it to **4–10 sentences** in plain Markdown — no bullet lists, just prose
 

@@ -39,7 +39,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .values()
         .filter(|s| matches!(s, AgentStatus::Done { .. }))
         .count();
-    let total = app.agents.len();
+    let total = app.agents.iter().filter(|a| a.agent.enabled).count();
 
     let title = format!(" Agent Runner — PR #{pr_num} ");
     let skipped = app

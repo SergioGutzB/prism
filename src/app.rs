@@ -161,6 +161,8 @@ pub struct App {
     pub compose_line: Option<u32>,
     pub compose_context: Vec<String>,
     pub diff_line_ext: Vec<Option<String>>,
+    /// Set to true once agent comments have been committed to the draft, preventing re-insertion.
+    pub agents_committed: bool,
     pub show_help: bool,
     pub show_stats: bool,
 
@@ -181,6 +183,8 @@ pub struct App {
     pub setup_repo: String,
     pub setup_field: SetupField,
     pub setup_saving: bool,
+    /// CONTRIBUTING.md or PR template fetched from the current repo (if available).
+    pub project_conventions: Option<String>,
 }
 
 impl App {
@@ -244,6 +248,7 @@ impl App {
             compose_line: None,
             compose_context: Vec::new(),
             diff_line_ext: Vec::new(),
+            agents_committed: false,
             show_help: false,
             show_stats: false,
             stats_range: 3,
@@ -259,6 +264,7 @@ impl App {
             setup_repo: String::new(),
             setup_field: SetupField::Owner,
             setup_saving: false,
+            project_conventions: None,
         }
     }
 

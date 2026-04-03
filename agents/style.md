@@ -58,7 +58,7 @@ Respond **ONLY** with a valid JSON array of comment objects. Each object must ha
 ```json
 [
   {
-    "file_path": "src/utils/helpers.rs",
+    "file_path": "src/utils/helpers.ext",
     "line": 8,
     "body": "**Unclear name**: `get_all_data()` is too generic — consider `fetch_active_users()`...",
     "severity": "suggestion"

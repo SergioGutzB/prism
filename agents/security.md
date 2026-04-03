@@ -50,7 +50,7 @@ Respond **ONLY** with a valid JSON array of comment objects. Each object must ha
 ```json
 [
   {
-    "file_path": "src/auth/middleware.rs",
+    "file_path": "src/auth/middleware.ext",
     "line": 42,
     "body": "**SQL Injection risk**: `user_id` is interpolated directly into the query...",
     "severity": "critical"

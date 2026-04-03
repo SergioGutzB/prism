@@ -57,7 +57,7 @@ Respond **ONLY** with a valid JSON array of comment objects. Each object must ha
 ```json
 [
   {
-    "file_path": "src/db/queries.rs",
+    "file_path": "src/db/queries.ext",
     "line": 67,
     "body": "**N+1 query**: for each user in the loop, `find_orders(user.id)` issues a...",
     "severity": "warning"

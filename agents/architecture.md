@@ -51,7 +51,7 @@ Respond **ONLY** with a valid JSON array of comment objects. Each object must ha
 ```json
 [
   {
-    "file_path": "src/services/user.rs",
+    "file_path": "src/services/user.ext",
     "line": 15,
     "body": "**Layering violation**: `UserService` is directly constructing SQL queries...",
     "severity": "warning"

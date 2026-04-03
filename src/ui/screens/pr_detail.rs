@@ -71,7 +71,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         ("[Z]", "Split")
     };
 
-    let review_count = app.draft.as_ref().map(|d| d.comments.len()).unwrap_or(0);
+    // Count root-level comments only (no replies) — matches GitHub's "Conversations" count.
+    let review_count = app.draft.as_ref()
+        .map(|d| d.comments.iter().filter(|c| c.parent_github_id.is_none()).count())
+        .unwrap_or(0);
     let reviews_label: String = if review_count > 0 {
         format!("Reviews({})", review_count)
     } else {

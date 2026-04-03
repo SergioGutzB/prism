@@ -213,38 +213,43 @@ impl ReviewDraft {
     }
 
     pub fn add_comment(&mut self, new_comment: GeneratedComment) {
-        // If it's a general comment (no file/line), just add it.
+        // GitHub-sourced comments: deduplicate by github_id (exact match, never duplicate).
+        if let Some(new_gh_id) = new_comment.github_id {
+            if self.comments.iter().any(|c| c.github_id == Some(new_gh_id)) {
+                return; // already present
+            }
+            self.comments.push(new_comment);
+            return;
+        }
+
+        // Agent/manual comments without a file+line: just push (no meaningful dedup key).
         if new_comment.file_path.is_none() || new_comment.line.is_none() {
             self.comments.push(new_comment);
             return;
         }
 
+        // Agent comments at a specific file+line: fuzzy-dedup by body similarity.
         let mut should_add = true;
         let mut to_replace = None;
 
         for (idx, existing) in self.comments.iter().enumerate() {
-            // Only compare if they are on the same file and line
+            if existing.github_id.is_some() { continue; } // don't replace GitHub comments
             if existing.file_path == new_comment.file_path && existing.line == new_comment.line {
-                // Calculate word-level similarity (Jaccard-like overlap)
                 let existing_words: std::collections::HashSet<_> = existing.effective_body().split_whitespace().map(|s| s.to_lowercase()).collect();
                 let new_words: std::collections::HashSet<_> = new_comment.effective_body().split_whitespace().map(|s| s.to_lowercase()).collect();
-                
+
                 if !existing_words.is_empty() && !new_words.is_empty() {
                     let intersection = existing_words.intersection(&new_words).count();
                     let union = existing_words.union(&new_words).count();
                     let similarity = (intersection as f32) / (union as f32);
 
-                    // If they are more than 50% similar, they are likely duplicates/redundant
                     if similarity > 0.5 {
-                        // Prioritize: 1. Manual over Agent, 2. Higher Severity, 3. Longer body
                         let existing_priority = (existing.source.score(), existing.severity.score(), existing.body.len());
                         let new_priority = (new_comment.source.score(), new_comment.severity.score(), new_comment.body.len());
 
                         if new_priority > existing_priority {
-                            // The new one is "better", we will replace the existing one
                             to_replace = Some(idx);
                         } else {
-                            // The existing one is better or equal, skip adding the new one
                             should_add = false;
                         }
                         break;
@@ -403,4 +408,247 @@ impl ReviewDraft {
             .replace("{comments_list}", &comments_list)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent_comment(file: &str, line: u32, body: &str, severity: Severity) -> GeneratedComment {
+        GeneratedComment::new(
+            CommentSource::Agent {
+                agent_id: "test".into(),
+                agent_name: "Test".into(),
+                agent_icon: "🤖".into(),
+            },
+            body.to_string(),
+            severity,
+            Some(file.to_string()),
+            Some(line),
+        )
+    }
+
+    fn manual_comment(file: &str, line: u32, body: &str, severity: Severity) -> GeneratedComment {
+        GeneratedComment::new(
+            CommentSource::Manual,
+            body.to_string(),
+            severity,
+            Some(file.to_string()),
+            Some(line),
+        )
+    }
+
+    fn gh_comment(github_id: u64, body: &str) -> GeneratedComment {
+        let mut c = GeneratedComment::new(
+            CommentSource::GithubReview { review_id: github_id, state: "commented".into(), user: "user".into() },
+            body.to_string(),
+            Severity::Suggestion,
+            None,
+            None,
+        );
+        c.github_id = Some(github_id);
+        c
+    }
+
+    // ── add_comment: github_id dedup ──────────────────────────────────────────
+
+    #[test]
+    fn add_comment_same_github_id_not_duplicated() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::ManualOnly);
+        draft.add_comment(gh_comment(42, "first body"));
+        draft.add_comment(gh_comment(42, "second body")); // same github_id → rejected
+        assert_eq!(draft.comments.len(), 1);
+        assert_eq!(draft.comments[0].body, "first body");
+    }
+
+    #[test]
+    fn add_comment_different_github_ids_both_kept() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::ManualOnly);
+        draft.add_comment(gh_comment(1, "body a"));
+        draft.add_comment(gh_comment(2, "body b"));
+        assert_eq!(draft.comments.len(), 2);
+    }
+
+    // ── add_comment: no file/line path ────────────────────────────────────────
+
+    #[test]
+    fn add_comment_no_file_path_always_appended() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::AiOnly);
+        let make = |body: &str| GeneratedComment::new(
+            CommentSource::Manual, body.to_string(), Severity::Suggestion, None, None,
+        );
+        draft.add_comment(make("summary 1"));
+        draft.add_comment(make("summary 2"));
+        // Summaries have no file path — always pushed, no dedup
+        assert_eq!(draft.comments.len(), 2);
+    }
+
+    // ── add_comment: fuzzy dedup by Jaccard similarity ────────────────────────
+
+    #[test]
+    fn add_comment_fuzzy_dedup_high_similarity_keeps_one() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::AiOnly);
+        // >50% word overlap → second is a near-duplicate of the first.
+        // intersection={this,function,is,too,long,and,be,refactored} = 8; union = 13 → 0.615 > 0.5
+        let c1 = agent_comment("src/lib.rs", 10, "This function is too long and needs to be refactored now", Severity::Warning);
+        let c2 = agent_comment("src/lib.rs", 10, "This function is too long and should be refactored soon", Severity::Warning);
+        draft.add_comment(c1);
+        draft.add_comment(c2);
+        assert_eq!(draft.comments.len(), 1);
+    }
+
+    #[test]
+    fn add_comment_fuzzy_dedup_different_lines_both_kept() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::AiOnly);
+        // Same text but different lines → both kept
+        let c1 = agent_comment("src/lib.rs", 10, "missing error handling", Severity::Warning);
+        let c2 = agent_comment("src/lib.rs", 20, "missing error handling", Severity::Warning);
+        draft.add_comment(c1);
+        draft.add_comment(c2);
+        assert_eq!(draft.comments.len(), 2);
+    }
+
+    #[test]
+    fn add_comment_fuzzy_dedup_different_files_both_kept() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::AiOnly);
+        let c1 = agent_comment("src/a.rs", 5, "missing error handling", Severity::Warning);
+        let c2 = agent_comment("src/b.rs", 5, "missing error handling", Severity::Warning);
+        draft.add_comment(c1);
+        draft.add_comment(c2);
+        assert_eq!(draft.comments.len(), 2);
+    }
+
+    #[test]
+    fn add_comment_fuzzy_dedup_low_similarity_both_kept() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::AiOnly);
+        // Completely different bodies → both kept
+        let c1 = agent_comment("src/lib.rs", 5, "missing error handling here", Severity::Warning);
+        let c2 = agent_comment("src/lib.rs", 5, "consider using a trait object instead", Severity::Suggestion);
+        draft.add_comment(c1);
+        draft.add_comment(c2);
+        assert_eq!(draft.comments.len(), 2);
+    }
+
+    #[test]
+    fn add_comment_manual_replaces_agent_at_same_location() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::AiOnly);
+        // Agent comment added first with identical-enough body
+        let agent = agent_comment("src/lib.rs", 10, "this function is very long please refactor it", Severity::Warning);
+        let manual = manual_comment("src/lib.rs", 10, "this function is very long you should refactor it now", Severity::Warning);
+        draft.add_comment(agent);
+        draft.add_comment(manual); // Manual has higher source score → should replace agent
+        assert_eq!(draft.comments.len(), 1);
+        assert!(matches!(draft.comments[0].source, CommentSource::Manual));
+    }
+
+    #[test]
+    fn add_comment_higher_severity_replaces_lower_at_same_location() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::AiOnly);
+        let low = agent_comment("src/lib.rs", 1, "this function is too complex and long", Severity::Suggestion);
+        let high = agent_comment("src/lib.rs", 1, "this function is too complex and buggy", Severity::Critical);
+        draft.add_comment(low);
+        draft.add_comment(high);
+        assert_eq!(draft.comments.len(), 1);
+        assert_eq!(draft.comments[0].severity, Severity::Critical);
+    }
+
+    // ── Severity ordering and parsing ─────────────────────────────────────────
+
+    #[test]
+    fn severity_score_ordering() {
+        assert!(Severity::Critical.score() > Severity::Warning.score());
+        assert!(Severity::Warning.score() > Severity::Suggestion.score());
+        assert!(Severity::Suggestion.score() > Severity::Praise.score());
+    }
+
+    #[test]
+    fn severity_from_str_roundtrip() {
+        for (s, expected) in [
+            ("critical", Severity::Critical),
+            ("warning", Severity::Warning),
+            ("suggestion", Severity::Suggestion),
+            ("praise", Severity::Praise),
+        ] {
+            let parsed: Severity = s.parse().expect("should parse");
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn severity_from_str_unknown_errors() {
+        let result: Result<Severity, _> = "blocker".parse();
+        assert!(result.is_err());
+    }
+
+    // ── CommentSource score ───────────────────────────────────────────────────
+
+    #[test]
+    fn comment_source_scores() {
+        assert_eq!(CommentSource::Manual.score(), 2);
+        assert_eq!(CommentSource::GithubReview { review_id: 1, state: "".into(), user: "".into() }.score(), 2);
+        assert_eq!(CommentSource::Agent { agent_id: "a".into(), agent_name: "A".into(), agent_icon: "".into() }.score(), 1);
+    }
+
+    // ── suggested_event ───────────────────────────────────────────────────────
+
+    #[test]
+    fn suggested_event_no_approved_comments_returns_approve() {
+        let draft = ReviewDraft::new(1, ReviewMode::ManualOnly);
+        assert_eq!(draft.suggested_event(), ReviewEvent::Approve);
+    }
+
+    #[test]
+    fn suggested_event_critical_comment_returns_request_changes() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::ManualOnly);
+        let mut c = agent_comment("a.rs", 1, "critical issue", Severity::Critical);
+        c.status = CommentStatus::Approved;
+        draft.comments.push(c);
+        assert_eq!(draft.suggested_event(), ReviewEvent::RequestChanges);
+    }
+
+    #[test]
+    fn suggested_event_warning_returns_request_changes() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::ManualOnly);
+        let mut c = agent_comment("a.rs", 1, "warning issue", Severity::Warning);
+        c.status = CommentStatus::Approved;
+        draft.comments.push(c);
+        assert_eq!(draft.suggested_event(), ReviewEvent::RequestChanges);
+    }
+
+    #[test]
+    fn suggested_event_suggestion_returns_comment() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::ManualOnly);
+        let mut c = agent_comment("a.rs", 1, "a suggestion", Severity::Suggestion);
+        c.status = CommentStatus::Approved;
+        draft.comments.push(c);
+        assert_eq!(draft.suggested_event(), ReviewEvent::Comment);
+    }
+
+    #[test]
+    fn suggested_event_only_rejected_comments_returns_approve() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::ManualOnly);
+        let mut c = agent_comment("a.rs", 1, "rejected warning", Severity::Warning);
+        c.status = CommentStatus::Rejected;
+        draft.comments.push(c);
+        // Rejected comments are not in approved_comments() → no max severity → Approve
+        assert_eq!(draft.suggested_event(), ReviewEvent::Approve);
+    }
+
+    // ── count helpers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn draft_counts_are_consistent() {
+        let mut draft = ReviewDraft::new(1, ReviewMode::AiOnly);
+        let c1 = agent_comment("a.rs", 1, "pending", Severity::Suggestion);
+        let mut c2 = agent_comment("b.rs", 2, "approved", Severity::Warning);
+        let mut c3 = agent_comment("c.rs", 3, "rejected", Severity::Critical);
+        c2.status = CommentStatus::Approved;
+        c3.status = CommentStatus::Rejected;
+        draft.comments.extend([c1, c2, c3]);
+
+        assert_eq!(draft.pending_count(), 1);
+        assert_eq!(draft.approved_count(), 1);
+        assert_eq!(draft.rejected_count(), 1);
+        assert_eq!(draft.submittable_count(), 2); // pending + approved
+    }
 }

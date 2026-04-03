@@ -94,6 +94,10 @@ pub struct ReviewContext {
     /// paths, overriding the agent's own `include_patterns`.
     /// Set by the orchestrator for partial cache hits.
     pub cache_skip_paths: Vec<String>,
+    /// Detected frameworks/build-tools inferred from file extensions and manifest names.
+    pub detected_frameworks: Vec<String>,
+    /// Contents of CONTRIBUTING.md / PR template fetched from the repo (if available).
+    pub project_conventions: Option<String>,
 }
 
 impl ReviewContext {
@@ -105,6 +109,8 @@ impl ReviewContext {
         let diff_stats = DiffStats::from_diff(diff);
         let changed_files = parse_changed_files(diff);
         let blob_shas = crate::review::cache::extract_blob_shas(diff);
+
+        let detected_frameworks = detect_frameworks(&changed_files, diff);
 
         Self {
             pr_number: pr.number,
@@ -124,6 +130,8 @@ impl ReviewContext {
             repo_slug: repo_slug.to_string(),
             blob_shas,
             cache_skip_paths: Vec::new(),
+            detected_frameworks,
+            project_conventions: None,
         }
     }
 
@@ -601,6 +609,133 @@ impl DiffStats {
     }
 }
 
+// ── Framework detection ───────────────────────────────────────────────────────
+
+/// Infer build tools and frameworks from file extensions and manifest file names
+/// present in the diff. Returns a deduplicated, sorted list of detected technologies.
+pub fn detect_frameworks(files: &[ChangedFile], diff: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut detected: BTreeSet<String> = BTreeSet::new();
+
+    // Map of manifest/config file names → technology label
+    let manifest_map: &[(&str, &str)] = &[
+        ("Cargo.toml",         "Cargo"),
+        ("Cargo.lock",         "Cargo"),
+        ("package.json",       "Node.js / npm"),
+        ("package-lock.json",  "Node.js / npm"),
+        ("yarn.lock",          "Node.js / Yarn"),
+        ("pnpm-lock.yaml",     "Node.js / pnpm"),
+        ("pyproject.toml",     "Python / Poetry"),
+        ("setup.py",           "Python / setuptools"),
+        ("requirements.txt",   "Python / pip"),
+        ("Pipfile",            "Python / Pipenv"),
+        ("go.mod",             "Go / modules"),
+        ("go.sum",             "Go / modules"),
+        ("pom.xml",            "Java / Maven"),
+        ("build.gradle",       "Java / Gradle"),
+        ("build.gradle.kts",   "Kotlin / Gradle"),
+        ("Gemfile",            "Ruby / Bundler"),
+        ("composer.json",      "PHP / Composer"),
+        ("pubspec.yaml",       "Dart / Flutter"),
+        ("mix.exs",            "Elixir / Mix"),
+        ("Makefile",           "Make"),
+        ("CMakeLists.txt",     "C/C++ / CMake"),
+        ("*.csproj",           "C# / .NET"),
+        ("*.sln",              "C# / .NET"),
+        ("tsconfig.json",      "TypeScript"),
+        ("next.config.*",      "Next.js"),
+        ("nuxt.config.*",      "Nuxt.js"),
+        ("vite.config.*",      "Vite"),
+        ("webpack.config.*",   "Webpack"),
+        ("tailwind.config.*",  "Tailwind CSS"),
+        ("docker-compose.*",   "Docker Compose"),
+        ("Dockerfile",         "Docker"),
+    ];
+
+    // Map of file extensions → language label
+    let ext_map: &[(&str, &str)] = &[
+        ("rs",    "Rust"),
+        ("ts",    "TypeScript"),
+        ("tsx",   "TypeScript / React"),
+        ("js",    "JavaScript"),
+        ("jsx",   "JavaScript / React"),
+        ("mjs",   "JavaScript"),
+        ("py",    "Python"),
+        ("go",    "Go"),
+        ("java",  "Java"),
+        ("kt",    "Kotlin"),
+        ("swift", "Swift"),
+        ("rb",    "Ruby"),
+        ("php",   "PHP"),
+        ("cs",    "C#"),
+        ("cpp",   "C++"),
+        ("cc",    "C++"),
+        ("c",     "C"),
+        ("h",     "C/C++"),
+        ("dart",  "Dart"),
+        ("ex",    "Elixir"),
+        ("exs",   "Elixir"),
+        ("hs",    "Haskell"),
+        ("scala", "Scala"),
+        ("clj",   "Clojure"),
+        ("vue",   "Vue.js"),
+        ("svelte","Svelte"),
+    ];
+
+    for file in files {
+        let name = std::path::Path::new(&file.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // Check manifest names (exact match on filename)
+        for (manifest, label) in manifest_map {
+            if manifest.starts_with('*') {
+                // Glob suffix: e.g. "*.csproj" → check extension
+                let ext = manifest.trim_start_matches("*.");
+                if name.ends_with(&format!(".{}", ext)) {
+                    detected.insert(label.to_string());
+                }
+            } else if name == *manifest || file.path == *manifest {
+                detected.insert(label.to_string());
+            }
+            // Partial match for config files like "next.config.*"
+            if manifest.ends_with(".*") {
+                let prefix = manifest.trim_end_matches(".*");
+                if name.starts_with(prefix) {
+                    detected.insert(label.to_string());
+                }
+            }
+        }
+
+        // Check file extension
+        if let Some(ext) = std::path::Path::new(&file.path).extension().and_then(|e| e.to_str()) {
+            for (file_ext, label) in ext_map {
+                if ext.eq_ignore_ascii_case(file_ext) {
+                    detected.insert(label.to_string());
+                }
+            }
+        }
+    }
+
+    // Also scan diff headers for manifest files not in changed_files list
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            for (manifest, label) in manifest_map {
+                if !manifest.contains('*') && (name == *manifest) {
+                    detected.insert(label.to_string());
+                }
+            }
+        }
+    }
+
+    detected.into_iter().collect()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -660,6 +795,249 @@ index 123..456 100644
         assert!(sections[1].1.starts_with("diff --git a/Cargo.lock"));
     }
 
+    // ── split_diff edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn split_diff_empty_string() {
+        let sections = split_diff_by_file("");
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn split_diff_single_file() {
+        let diff = "diff --git a/foo.rs b/foo.rs\n+line\n";
+        let sections = split_diff_by_file(diff);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].0, "foo.rs");
+        assert!(sections[0].1.contains("+line"));
+    }
+
+    #[test]
+    fn split_diff_file_with_spaces_in_path() {
+        let diff = "diff --git a/src/my file.rs b/src/my file.rs\n+code\n";
+        let sections = split_diff_by_file(diff);
+        // Path after last " b/" should be "src/my file.rs"
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].0, "src/my file.rs");
+    }
+
+    #[test]
+    fn split_diff_no_trailing_newline() {
+        let diff = "diff --git a/a.rs b/a.rs\n+x";
+        let sections = split_diff_by_file(diff);
+        assert_eq!(sections.len(), 1);
+        assert!(sections[0].1.contains("+x"));
+    }
+
+    // ── parse_changed_files ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_files_counts_additions_and_deletions() {
+        let diff = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index abc..def 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
+ unchanged
++added line
++another add
+-removed line
+";
+        let files = parse_changed_files(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].additions, 2);
+        assert_eq!(files[0].deletions, 1);
+    }
+
+    #[test]
+    fn parse_files_detects_new_file() {
+        let diff = "\
+diff --git a/src/new.rs b/src/new.rs
+new file mode 100644
++fn foo() {}
+";
+        let files = parse_changed_files(diff);
+        assert_eq!(files.len(), 1);
+        assert!(matches!(files[0].status, FileStatus::Added));
+    }
+
+    #[test]
+    fn parse_files_detects_deleted_file() {
+        let diff = "\
+diff --git a/src/old.rs b/src/old.rs
+deleted file mode 100644
+-fn old() {}
+";
+        let files = parse_changed_files(diff);
+        assert_eq!(files.len(), 1);
+        assert!(matches!(files[0].status, FileStatus::Deleted));
+    }
+
+    #[test]
+    fn parse_files_detects_rename() {
+        let diff = "\
+diff --git a/src/a.rs b/src/b.rs
+rename from src/a.rs
+rename to src/b.rs
+";
+        let files = parse_changed_files(diff);
+        assert_eq!(files.len(), 1);
+        assert!(matches!(&files[0].status, FileStatus::Renamed { from } if from == "src/a.rs"));
+    }
+
+    #[test]
+    fn parse_files_marks_lock_file_as_generated() {
+        let diff = "diff --git a/Cargo.lock b/Cargo.lock\n+[package]\n";
+        let files = parse_changed_files(diff);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].is_generated, "Cargo.lock should be marked as generated");
+    }
+
+    #[test]
+    fn parse_files_does_not_count_diff_header_lines() {
+        // Lines starting with +++ and --- are diff headers, not additions/deletions
+        let diff = "\
+diff --git a/foo.py b/foo.py
+--- a/foo.py
++++ b/foo.py
+@@ -1 +1 @@
+-old
++new
+";
+        let files = parse_changed_files(diff);
+        assert_eq!(files[0].additions, 1);
+        assert_eq!(files[0].deletions, 1);
+    }
+
+    // ── DiffStats ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn diff_stats_empty_diff() {
+        let s = DiffStats::from_diff("");
+        assert_eq!(s.files_changed, 0);
+        assert_eq!(s.total_additions, 0);
+        assert_eq!(s.total_deletions, 0);
+    }
+
+    #[test]
+    fn diff_stats_counts_correctly() {
+        let diff = "\
+diff --git a/a.ts b/a.ts
++++ b/a.ts
++line1
++line2
+-removed
+diff --git a/b.ts b/b.ts
++line3
+";
+        let s = DiffStats::from_diff(diff);
+        assert_eq!(s.files_changed, 2);
+        assert_eq!(s.total_additions, 3);
+        assert_eq!(s.total_deletions, 1);
+    }
+
+    // ── detect_frameworks ─────────────────────────────────────────────────────
+
+    fn make_changed_file(path: &str) -> ChangedFile {
+        ChangedFile {
+            path: path.to_string(),
+            status: FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+            diff_hunk: String::new(),
+            is_generated: false,
+        }
+    }
+
+    #[test]
+    fn detect_rust_from_cargo_toml() {
+        let files = vec![make_changed_file("Cargo.toml")];
+        let result = detect_frameworks(&files, "");
+        assert!(result.contains(&"Cargo".to_string()));
+    }
+
+    #[test]
+    fn detect_typescript_from_extension() {
+        let files = vec![make_changed_file("src/app.ts")];
+        let result = detect_frameworks(&files, "");
+        assert!(result.contains(&"TypeScript".to_string()));
+    }
+
+    #[test]
+    fn detect_react_from_tsx() {
+        let files = vec![make_changed_file("src/App.tsx")];
+        let result = detect_frameworks(&files, "");
+        assert!(result.contains(&"TypeScript / React".to_string()));
+    }
+
+    #[test]
+    fn detect_nextjs_from_config() {
+        let files = vec![make_changed_file("next.config.js")];
+        let result = detect_frameworks(&files, "");
+        assert!(result.contains(&"Next.js".to_string()));
+    }
+
+    #[test]
+    fn detect_multiple_frameworks() {
+        let files = vec![
+            make_changed_file("Cargo.toml"),
+            make_changed_file("package.json"),
+            make_changed_file("src/lib.rs"),
+        ];
+        let result = detect_frameworks(&files, "");
+        assert!(result.contains(&"Cargo".to_string()));
+        assert!(result.contains(&"Node.js / npm".to_string()));
+        assert!(result.contains(&"Rust".to_string()));
+    }
+
+    #[test]
+    fn detect_frameworks_from_diff_headers() {
+        // Files not in changed_files but visible in diff +++ headers
+        let diff = "+++ b/go.mod\n+module myapp\n";
+        let result = detect_frameworks(&[], diff);
+        assert!(result.contains(&"Go / modules".to_string()));
+    }
+
+    #[test]
+    fn detect_frameworks_deduplicates() {
+        // Two .ts files should only produce "TypeScript" once
+        let files = vec![
+            make_changed_file("src/a.ts"),
+            make_changed_file("src/b.ts"),
+        ];
+        let result = detect_frameworks(&files, "");
+        let ts_count = result.iter().filter(|s| *s == "TypeScript").count();
+        assert_eq!(ts_count, 1);
+    }
+
+    #[test]
+    fn detect_frameworks_empty_diff() {
+        let result = detect_frameworks(&[], "");
+        assert!(result.is_empty());
+    }
+
+    // ── glob edge cases ───────────────────────────────────────────────────────
+
+    #[test]
+    fn glob_empty_pattern_matches_only_empty_path() {
+        assert!(file_matches_pattern("", ""));
+        assert!(!file_matches_pattern("", "foo"));
+    }
+
+    #[test]
+    fn glob_star_only_matches_anything() {
+        assert!(file_matches_pattern("*", "foo.rs"));
+        assert!(file_matches_pattern("*", ""));
+        assert!(file_matches_pattern("*", "a/b/c.ts"));
+    }
+
+    #[test]
+    fn glob_min_js_matches_in_subdirectory() {
+        assert!(file_matches_pattern("*.min.js", "dist/bundle.min.js"));
+        assert!(!file_matches_pattern("*.min.js", "dist/bundle.js"));
+    }
+
     #[test]
     fn prepare_diff_excludes_patterns() {
         let diff = "\
@@ -689,6 +1067,8 @@ index 123..456 100644
             repo_slug: "owner/repo".to_string(),
             blob_shas: std::collections::HashMap::new(),
             cache_skip_paths: vec![],
+            detected_frameworks: vec![],
+            project_conventions: None,
         };
         let prepared = ctx.prepare_diff(
             &["*.lock".to_string()],

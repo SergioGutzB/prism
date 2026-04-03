@@ -189,6 +189,7 @@ async fn main() -> Result<()> {
                     }
                     AppEvent::PrLoaded(pr) => { app.current_pr = Some(*pr); app.pr_loading = false; }
                     AppEvent::DiffLoaded(diff) => {
+                        app.diff_line_ext = build_diff_line_ext(&diff);
                         app.diff_lines_cache = Some(diff.lines().map(str::to_string).collect());
                         app.current_diff = Some(diff);
                         app.diff_loading = false;
@@ -205,17 +206,24 @@ async fn main() -> Result<()> {
                             populate_checklist_from_diff(draft, d);
                         }
                         // Restore the persisted draft (all comments + checklist state).
-                        // Merge: keep the file checklist from the diff (always fresh), but
-                        // restore comments and checked flags from disk.
+                        // We merge rather than replace so that comments already added by a
+                        // preceding ReviewsLoaded (race) are not lost.
                         let repo_slug = format!("{}/{}", config.github.owner, config.github.repo);
                         if let Some(pr_num) = app.draft.as_ref().map(|d| d.pr_number) {
                             if let Some(saved) = review::draft_store::load(pr_num, &repo_slug) {
                                 if let Some(draft) = &mut app.draft {
-                                    // Restore comments from disk
+                                    // Keep any comments already in draft (e.g. from ReviewsLoaded
+                                    // arriving before us) that are not in the saved file, then
+                                    // start from the saved set and add_comment the in-memory ones.
+                                    let in_memory = std::mem::take(&mut draft.comments);
                                     draft.comments = saved.comments;
                                     draft.review_body = saved.review_body;
                                     draft.review_event = saved.review_event;
                                     draft.mode = saved.mode;
+                                    // Re-merge any comments that arrived before us (dedup by github_id)
+                                    for c in in_memory {
+                                        draft.add_comment(c);
+                                    }
                                     // Restore check marks for files that still exist in the diff
                                     for (path, checked) in &saved.file_checklist {
                                         if let Some(entry) = draft.file_checklist.get_mut(path) {
@@ -278,6 +286,9 @@ async fn main() -> Result<()> {
                         }
                         app.set_status("Comment updated on GitHub.");
                         save_draft(&app, &config);
+                    }
+                    AppEvent::ConventionsLoaded(conventions) => {
+                        app.project_conventions = conventions;
                     }
                     _ => {}
                 }
@@ -951,6 +962,25 @@ fn prune_closed_drafts(repo_slug: &str, open_numbers: &[u64]) {
     review::draft_store::prune_closed(repo_slug, open_numbers);
 }
 
+/// Build a per-line file-extension vector from a unified diff.
+/// Each entry is `Some("rs")` for lines belonging to a `+++ b/foo.rs` file,
+/// or `None` for lines with no recognised extension (meta/hunk headers).
+fn build_diff_line_ext(diff: &str) -> Vec<Option<String>> {
+    let mut result = Vec::new();
+    let mut current_ext: Option<String> = None;
+    for line in diff.lines() {
+        if line.starts_with("+++ b/") {
+            let path = &line[6..];
+            current_ext = std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase());
+        }
+        result.push(current_ext.clone());
+    }
+    result
+}
+
 fn handle_agent_update(app: &mut App, update: agents::orchestrator::AgentUpdate, config: &config::AppConfig) {
     use agents::models::AgentStatus;
     if let AgentStatus::Done { input_tokens, output_tokens, .. } = &update.status {
@@ -976,7 +1006,8 @@ fn handle_agent_update(app: &mut App, update: agents::orchestrator::AgentUpdate,
             matches!(app.agent_statuses.get(&a.agent.id), 
                 Some(AgentStatus::Done {..}) | Some(AgentStatus::Failed {..}) | Some(AgentStatus::Skipped {..}))
         });
-        if all_done {
+        if all_done && !app.agents_committed {
+            app.agents_committed = true;
             if let Some(draft) = &mut app.draft {
                 for status in app.agent_statuses.values() {
                     if let AgentStatus::Done { comments, .. } = status {
@@ -1036,6 +1067,7 @@ async fn open_pr(app: &mut App, event_tx: &mpsc::UnboundedSender<AppEvent>, conf
     app.compose_line = None;
     app.compose_context = Vec::new();
     app.current_ticket = None;
+    app.project_conventions = None;
     app.file_tree_line = 0;
     app.file_tree_pane = 0;
     app.file_tree_scroll = 0;
@@ -1074,6 +1106,19 @@ async fn open_pr(app: &mut App, event_tx: &mpsc::UnboundedSender<AppEvent>, conf
             let _ = tx.send(AppEvent::ReviewsLoaded(pr_num, reviews, comments));
         }
     });
+
+    // Opportunistically fetch project conventions — CONTRIBUTING.md or PR template
+    let tx = event_tx.clone();
+    let cfg = config.clone();
+    tokio::spawn(async move {
+        if let Ok(api) = make_github_api(&cfg).await {
+            let conventions = match api.get_file_content("CONTRIBUTING.md").await {
+                Some(c) => Some(c),
+                None => api.get_file_content(".github/PULL_REQUEST_TEMPLATE.md").await,
+            };
+            let _ = tx.send(AppEvent::ConventionsLoaded(conventions));
+        }
+    });
 }
 
 fn start_agent_runner(app: &mut App, config: &config::AppConfig) {
@@ -1082,13 +1127,15 @@ fn start_agent_runner(app: &mut App, config: &config::AppConfig) {
     let pr = match &app.current_pr { Some(p) => p.clone(), None => return };
     let diff = app.current_diff.clone().unwrap_or_default();
     let repo_slug = format!("{}/{}", config.github.owner, config.github.repo);
-    let ctx = ReviewContext::from_pr(&pr, &diff, None, &repo_slug);
+    let mut ctx = ReviewContext::from_pr(&pr, &diff, None, &repo_slug);
+    ctx.project_conventions = app.project_conventions.clone();
     
     app.draft = Some(review::models::ReviewDraft::new(pr.number, review::models::ReviewMode::AiOnly));
     if let (Some(draft), Some(diff)) = (&mut app.draft, &app.current_diff) {
         populate_checklist_from_diff(draft, diff);
     }
     app.agent_statuses.clear();
+    app.agents_committed = false;
     app.navigate_to(Screen::AgentRunner);
 
     let orchestrator = Orchestrator::new(config.clone());

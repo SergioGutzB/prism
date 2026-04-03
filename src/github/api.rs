@@ -313,6 +313,25 @@ impl GitHubApi {
         Ok(())
     }
 
+    /// Fetch the raw text content of a file from the default branch (best-effort).
+    /// Returns `None` if the file does not exist or the request fails.
+    pub async fn get_file_content(&self, path: &str) -> Option<String> {
+        let url = format!(
+            "{}/repos/{}/{}/contents/{}",
+            self.client.base_url, self.client.owner, self.client.repo, path
+        );
+        let response = self.client.client
+            .get(&url)
+            .header("Accept", "application/vnd.github.raw")
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.text().await.ok()
+    }
+
     /// Get the primary language of the repository.
     async fn get_repo_language(&self) -> Result<Option<String>> {
         let url = format!(

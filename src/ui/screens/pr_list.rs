@@ -161,12 +161,13 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .map(|h| Cell::from(*h).style(Style::default().fg(t.title).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
+    let now = chrono::Utc::now();
     let rows: Vec<Row> = prs
         .iter()
         .enumerate()
         .map(|(i, pr)| {
             let selected = i == app.pr_list_selected;
-            let age = format_age(pr.updated_at);
+            let age = format_age(pr.updated_at, now);
             // PrSummary doesn't carry labels; leave blank
             let labels: String = String::new();
             let draft_marker = if pr.draft { " [draft]" } else { "" };
@@ -234,8 +235,7 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     }
 }
 
-fn format_age(dt: chrono::DateTime<chrono::Utc>) -> String {
-    let now = chrono::Utc::now();
+fn format_age(dt: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
     let diff = now.signed_duration_since(dt);
     if diff.num_days() > 0 {
         format!("{}d", diff.num_days())

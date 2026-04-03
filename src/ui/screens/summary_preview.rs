@@ -194,7 +194,7 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
 
     let total = approved.len();
     let visible_h = area.height.saturating_sub(2) as usize;
-    let scroll = app.summary_comments_scroll.min(total.saturating_sub(visible_h / 2));
+    let scroll = app.summary_comments_scroll.min(total.saturating_sub(visible_h));
 
     let list = List::new(items)
         .block(

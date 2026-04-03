@@ -55,7 +55,7 @@ Respond **ONLY** with a valid JSON array of comment objects. Each object must ha
 ```json
 [
   {
-    "file_path": "src/auth/service.rs",
+    "file_path": "src/auth/service.ext",
     "line": 23,
     "body": "**Missing test for error path**: `authenticate()` can return `Err(...)` when...",
     "severity": "warning"

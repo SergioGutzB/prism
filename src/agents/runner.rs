@@ -89,7 +89,7 @@ impl AgentRunner {
         let input_tokens = ((system_len + prompt.len()) / 4) as u64;
         let output_tokens = (raw_response.len() / 4) as u64;
 
-        let json_str = strip_markdown_fences(&raw_response);
+        let json_str = extract_json(strip_markdown_fences(&raw_response));
         let raw: RawObjective = serde_json::from_str(json_str)
             .context("Failed to parse objective analysis JSON")?;
 
@@ -179,6 +179,32 @@ impl AgentRunner {
 
     fn build_prompt(&self, agent: &AgentDefinition, ctx: &ReviewContext) -> String {
         let mut parts: Vec<String> = Vec::new();
+
+        // Repository context: language, frameworks, conventions — always injected
+        {
+            let mut repo_ctx = String::from("## Repository Context\n\n");
+            if let Some(lang) = &ctx.repo_language {
+                repo_ctx.push_str(&format!("**Primary Language:** {lang}\n"));
+            }
+            if !ctx.detected_frameworks.is_empty() {
+                repo_ctx.push_str(&format!(
+                    "**Detected Frameworks/Tools:** {}\n",
+                    ctx.detected_frameworks.join(", ")
+                ));
+            }
+            if let Some(conventions) = &ctx.project_conventions {
+                let truncated = if conventions.len() > 2000 {
+                    format!("{}…\n*(truncated)*", &conventions[..2000])
+                } else {
+                    conventions.clone()
+                };
+                repo_ctx.push_str(&format!("\n**Project Conventions:**\n{truncated}\n"));
+            }
+            // Only push if we have something beyond the header
+            if repo_ctx.len() > "## Repository Context\n\n".len() {
+                parts.push(repo_ctx);
+            }
+        }
 
         if agent.agent.context.include_pr_description {
             parts.push(format!(
@@ -281,7 +307,7 @@ impl AgentRunner {
     }
 
     fn parse_response(&self, agent: &AgentDefinition, response: &str) -> Result<Vec<GeneratedComment>> {
-        let json_str = strip_markdown_fences(response);
+        let json_str = extract_json(strip_markdown_fences(response));
 
         if agent.agent.id == "summary" {
             let raw: RawSummary = serde_json::from_str(json_str)
@@ -379,6 +405,7 @@ async fn call_claude_cli(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .context("Failed to spawn `claude` — is Claude Code installed and in PATH?")?;
 
@@ -387,6 +414,7 @@ async fn call_claude_cli(
             .context("Failed to write prompt to claude stdin")?;
     }
 
+    // kill_on_drop(true) ensures the child is killed if the timeout fires and drops the future
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
         child.wait_with_output(),
@@ -679,7 +707,149 @@ fn strip_markdown_fences(s: &str) -> &str {
     s.trim()
 }
 
+/// After stripping fences, find the first `{` or `[` and last `}` or `]` to extract
+/// valid JSON even when the LLM prepends preamble text before the JSON object.
+fn extract_json(s: &str) -> &str {
+    let start = s.find(|c| c == '{' || c == '[');
+    let end_obj = s.rfind('}');
+    let end_arr = s.rfind(']');
+    let end = match (end_obj, end_arr) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    match (start, end) {
+        (Some(i), Some(j)) if j > i => &s[i..=j],
+        _ => s,
+    }
+}
+
 fn parse_severity(s: Option<&str>) -> Severity {
     s.and_then(|v| v.parse::<Severity>().ok())
         .unwrap_or(Severity::Suggestion)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── strip_markdown_fences ─────────────────────────────────────────────────
+
+    #[test]
+    fn strip_fences_removes_json_tagged_block() {
+        let input = "```json\n[{\"body\":\"ok\"}]\n```";
+        assert_eq!(strip_markdown_fences(input), "[{\"body\":\"ok\"}]");
+    }
+
+    #[test]
+    fn strip_fences_removes_untagged_block() {
+        let input = "```\n{\"key\":\"val\"}\n```";
+        assert_eq!(strip_markdown_fences(input), "{\"key\":\"val\"}");
+    }
+
+    #[test]
+    fn strip_fences_no_fences_unchanged() {
+        let input = "[{\"body\":\"hello\"}]";
+        assert_eq!(strip_markdown_fences(input), input);
+    }
+
+    #[test]
+    fn strip_fences_trims_whitespace() {
+        let input = "  \n```json\n{}\n```\n  ";
+        assert_eq!(strip_markdown_fences(input), "{}");
+    }
+
+    #[test]
+    fn strip_fences_only_opening_fence_returned_as_content() {
+        // No closing fence — trim_end_matches won't strip anything, content is returned as-is
+        let input = "```json\n[1, 2, 3]";
+        let result = strip_markdown_fences(input);
+        // Should still return the content (minus opening fence), not crash
+        assert!(result.contains("[1, 2, 3]"));
+    }
+
+    // ── extract_json ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_json_clean_object() {
+        let input = r#"{"body":"hello"}"#;
+        assert_eq!(extract_json(input), r#"{"body":"hello"}"#);
+    }
+
+    #[test]
+    fn extract_json_clean_array() {
+        let input = r#"[{"body":"a"},{"body":"b"}]"#;
+        assert_eq!(extract_json(input), input);
+    }
+
+    #[test]
+    fn extract_json_strips_preamble() {
+        let input = r#"Here is the JSON output: {"body":"x","severity":"warning"}"#;
+        assert_eq!(extract_json(input), r#"{"body":"x","severity":"warning"}"#);
+    }
+
+    #[test]
+    fn extract_json_strips_postamble() {
+        let input = r#"{"body":"x"} Hope this helps!"#;
+        // rfind('}') finds the one after "x", rfind(']') finds nothing → slice [0..=9]
+        assert_eq!(extract_json(input), r#"{"body":"x"}"#);
+    }
+
+    #[test]
+    fn extract_json_strips_preamble_and_postamble() {
+        let input = r#"Sure! Here: [{"body":"y"}] Done."#;
+        assert_eq!(extract_json(input), r#"[{"body":"y"}]"#);
+    }
+
+    #[test]
+    fn extract_json_nested_objects_preserved() {
+        let input = r#"{"outer":{"inner":"val"}}"#;
+        assert_eq!(extract_json(input), input);
+    }
+
+    #[test]
+    fn extract_json_no_json_returns_original() {
+        let input = "No JSON here at all";
+        assert_eq!(extract_json(input), input);
+    }
+
+    #[test]
+    fn extract_json_only_open_brace_returns_original() {
+        // start found but no matching end → returns original
+        let input = "prefix { no close";
+        // start=7, no '}' → returns original
+        assert_eq!(extract_json(input), input);
+    }
+
+    #[test]
+    fn extract_json_array_inside_prose() {
+        let input = "Result: [{\"file_path\":\"foo.rs\",\"line\":1,\"body\":\"b\",\"severity\":\"warning\"}]";
+        let result = extract_json(input);
+        assert!(result.starts_with('['));
+        assert!(result.ends_with(']'));
+        assert!(result.contains("\"body\":\"b\""));
+    }
+
+    // ── parse_severity ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_severity_known_values() {
+        assert_eq!(parse_severity(Some("critical")), Severity::Critical);
+        assert_eq!(parse_severity(Some("warning")), Severity::Warning);
+        assert_eq!(parse_severity(Some("suggestion")), Severity::Suggestion);
+        assert_eq!(parse_severity(Some("praise")), Severity::Praise);
+    }
+
+    #[test]
+    fn parse_severity_unknown_defaults_to_suggestion() {
+        assert_eq!(parse_severity(Some("blocker")), Severity::Suggestion);
+        assert_eq!(parse_severity(None), Severity::Suggestion);
+    }
+
+    #[test]
+    fn parse_severity_case_insensitive() {
+        assert_eq!(parse_severity(Some("CRITICAL")), Severity::Critical);
+        assert_eq!(parse_severity(Some("Warning")), Severity::Warning);
+    }
 }

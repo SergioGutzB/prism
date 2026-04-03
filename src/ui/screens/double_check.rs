@@ -131,13 +131,17 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
+    // Count root-level comments only (no replies) so the count matches GitHub's "conversations".
     let (total, approved, rejected, pending) = match &app.draft {
-        Some(d) => (
-            d.comments.len(),
-            d.approved_count(),
-            d.rejected_count(),
-            d.pending_count(),
-        ),
+        Some(d) => {
+            let roots: Vec<_> = d.comments.iter().filter(|c| c.parent_github_id.is_none()).collect();
+            (
+                roots.len(),
+                roots.iter().filter(|c| c.status == CommentStatus::Approved).count(),
+                roots.iter().filter(|c| c.status == CommentStatus::Rejected).count(),
+                roots.iter().filter(|c| c.status == CommentStatus::Pending).count(),
+            )
+        }
         None => (0, 0, 0, 0),
     };
 
@@ -459,26 +463,39 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         CommentSource::GithubReview { user, state, .. } => format!("💬 GitHub Review — {} ({})", user, state),
     };
 
-    // Thread info: show parent ref + reply count for this comment
-    let thread_info: Option<String> = if comment.parent_github_id.is_some() {
-        Some("  ↳ reply in thread".to_string())
-    } else {
-        let replies = threaded_comments(app)
-            .into_iter()
-            .filter(|(_, c, _)| c.parent_github_id == comment.github_id && comment.github_id.is_some())
-            .count();
-        if replies > 0 {
-            Some(format!("  {} repl{} in thread", replies, if replies == 1 { "y" } else { "ies" }))
-        } else {
-            None
-        }
-    };
-
     let location_line = match (&comment.file_path, comment.line) {
         (Some(f), Some(l)) => format!("{}:{}", f, l),
         (Some(f), None)    => f.clone(),
         _                  => "(no file)".to_string(),
     };
+
+    // Determine if this comment is part of a thread (root with replies, or a reply)
+    let all_threaded = threaded_comments(app);
+    let thread_root_gh_id: Option<u64> = if comment.parent_github_id.is_some() {
+        comment.parent_github_id
+    } else if comment.github_id.is_some()
+        && all_threaded.iter().any(|(_, c, _)| c.parent_github_id == comment.github_id)
+    {
+        comment.github_id
+    } else {
+        None
+    };
+
+    // Collect the full thread (root + replies in order) when applicable
+    let thread: Vec<&crate::review::models::GeneratedComment> = if let Some(root_id) = thread_root_gh_id {
+        all_threaded
+            .iter()
+            .filter(|(_, c, _)| c.github_id == Some(root_id) || c.parent_github_id == Some(root_id))
+            .map(|(_, c, _)| *c)
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let divider = Span::styled(
+        "─".repeat(area.width.saturating_sub(4) as usize),
+        Style::default().fg(t.border),
+    );
 
     // Build lines for the detail panel
     let mut lines: Vec<Line> = vec![
@@ -489,15 +506,9 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ]),
         Line::from(Span::styled(source_line, Style::default().fg(t.muted))),
         Line::from(Span::styled(location_line, Style::default().fg(t.suggestion))),
+        Line::from(divider.clone()),
+        Line::from(""),
     ];
-    if let Some(tinfo) = thread_info {
-        lines.push(Line::from(Span::styled(tinfo, Style::default().fg(t.warning))));
-    }
-    lines.push(Line::from(Span::styled(
-        "─".repeat(area.width.saturating_sub(4) as usize),
-        Style::default().fg(t.border),
-    )));
-    lines.push(Line::from(""));
 
     // Code context block — shown when the comment is tied to a specific file+line
     if let (Some(file_path), Some(target_line)) = (&comment.file_path, comment.line) {
@@ -529,7 +540,6 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
                     };
                     let ln_str = if *ln > 0 { format!("{:4}", ln) } else { "    ".to_string() };
 
-                    // Build line: gutter | line-number | highlighted code
                     let mut spans = vec![
                         Span::styled(
                             format!(" {} ", marker),
@@ -540,10 +550,8 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
                             Style::default().fg(t.muted).bg(row_bg),
                         ),
                     ];
-                    // Only apply syntax highlight for context/add lines (not removed lines)
                     if *kind != '-' {
-                        let bg_override = Some(row_bg);
-                        spans.extend(syntax::highlight(content, ext, bg_override));
+                        spans.extend(syntax::highlight(content, ext, Some(row_bg)));
                     } else {
                         spans.push(Span::styled(
                             content.clone(),
@@ -552,21 +560,76 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
                     }
                     lines.push(Line::from(spans));
                 }
-                lines.push(Line::from(Span::styled(
-                    "─".repeat(area.width.saturating_sub(4) as usize),
-                    Style::default().fg(t.border),
-                )));
+                lines.push(Line::from(divider.clone()));
                 lines.push(Line::from(""));
             }
         }
     }
 
-    // Add full comment body — split into lines
-    let body = comment.effective_body();
-    for line in body.lines() {
-        lines.push(Line::from(line.to_string()));
+    // ── Thread conversation ────────────────────────────────────────────────────
+    if !thread.is_empty() {
+        let thread_count = thread.len();
+        lines.push(Line::from(Span::styled(
+            format!(" 💬 Thread ({} message{})", thread_count, if thread_count == 1 { "" } else { "s" }),
+            Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+
+        for tc in &thread {
+            let is_selected = tc.id == comment.id;
+            let is_reply = tc.parent_github_id.is_some();
+            let indent = if is_reply { "    " } else { "" };
+            let connector = if is_reply { "┗ " } else { "┌ " };
+
+            let tc_author = match &tc.source {
+                CommentSource::Agent { agent_icon, agent_name, .. } => format!("{} {}", agent_icon, agent_name),
+                CommentSource::Manual => "✍ you".to_string(),
+                CommentSource::GithubReview { user, .. } => user.clone(),
+            };
+            let tc_status_icon = match tc.status {
+                CommentStatus::Approved => "✓",
+                CommentStatus::Rejected => "✗",
+                CommentStatus::Pending  => "○",
+            };
+            let tc_status_color = match tc.status {
+                CommentStatus::Approved => t.agent_done,
+                CommentStatus::Rejected => t.agent_failed,
+                CommentStatus::Pending  => t.muted,
+            };
+
+            // Header row: connector + author + status
+            let header_style = if is_selected {
+                Style::default().fg(t.selected_fg).bg(t.selected_bg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.title)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}{}", indent, connector), Style::default().fg(t.border)),
+                Span::styled(tc_author, header_style),
+                Span::raw("  "),
+                Span::styled(tc_status_icon, Style::default().fg(tc_status_color)),
+            ]));
+
+            // Body rows (indented)
+            let body_indent = if is_reply { "      " } else { "  " };
+            for body_line in tc.effective_body().lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("{}{}", body_indent, body_line),
+                    Style::default().fg(if is_selected { t.foreground } else { t.foreground }),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(divider.clone()));
+    } else {
+        // No thread — just show the comment body
+        let body = comment.effective_body();
+        for line in body.lines() {
+            lines.push(Line::from(line.to_string()));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(divider.clone()));
     }
-    lines.push(Line::from(""));
 
     // Add hint at bottom
     lines.push(Line::from(Span::styled(

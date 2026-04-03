@@ -42,6 +42,8 @@ pub enum AppEvent {
     CommentDeleted(uuid::Uuid),
     /// A comment body was successfully updated on GitHub.
     CommentUpdated(uuid::Uuid, String),
+    /// Fetched project conventions (CONTRIBUTING.md / PR template) for the current repo.
+    ConventionsLoaded(Option<String>),
 }
 
 /// Spawn a background thread that polls crossterm key events.
