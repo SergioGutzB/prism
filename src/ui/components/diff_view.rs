@@ -175,7 +175,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, t: &Theme, focused: bool
 
 /// A row in a parsed side-by-side diff.
 #[derive(Debug, Clone)]
-enum SplitLine {
+pub(crate) enum SplitLine {
     /// Full-width line: file header, index, or @@ hunk marker.
     Wide { text: String, is_hunk: bool, raw_idx: usize },
     /// Side-by-side pair: old (left) and new (right).
@@ -237,7 +237,7 @@ fn flush_bufs(
 }
 
 /// Convert a flat unified-diff line cache into paired side-by-side rows.
-fn parse_to_split(lines: &[String]) -> Vec<SplitLine> {
+pub(crate) fn parse_to_split(lines: &[String]) -> Vec<SplitLine> {
     let mut result: Vec<SplitLine> = Vec::new();
     let mut old_buf: Vec<(u32, String, usize)> = Vec::new();
     let mut new_buf: Vec<(u32, String, usize)> = Vec::new();
@@ -451,7 +451,15 @@ pub fn render_split(frame: &mut Frame, app: &App, area: Rect, t: &Theme, focused
         return;
     }
 
-    let split_rows = parse_to_split(raw_lines);
+    // Use the pre-computed split cache when available. Fall back to on-the-fly
+    // parsing only if the cache is absent (should not happen in normal flow).
+    let owned;
+    let split_rows: &[SplitLine] = if let Some(cache) = &app.split_diff_cache {
+        cache
+    } else {
+        owned = parse_to_split(raw_lines);
+        &owned
+    };
     let total = split_rows.len();
     let height = inner.height as usize;
     let max_scroll = total.saturating_sub(height);

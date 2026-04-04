@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ratatui::prelude::*;
 
 use crate::agents::models::AgentStatus;
@@ -11,15 +13,15 @@ pub fn status_line<'a>(
     spinner: char,
     t: &Theme,
 ) -> Line<'a> {
-    let (status_icon, style) = match status {
-        None | Some(AgentStatus::Pending) => ("○", Style::default().fg(t.muted)),
-        Some(AgentStatus::Disabled) => ("─", Style::default().fg(t.agent_disabled)),
+    let (status_icon, style): (Cow<'static, str>, Style) = match status {
+        None | Some(AgentStatus::Pending) => (Cow::Borrowed("○"), Style::default().fg(t.muted)),
+        Some(AgentStatus::Disabled) => (Cow::Borrowed("─"), Style::default().fg(t.agent_disabled)),
         Some(AgentStatus::Running { .. }) => {
-            (&*Box::leak(spinner.to_string().into_boxed_str()), Style::default().fg(t.agent_running))
+            (Cow::Owned(spinner.to_string()), Style::default().fg(t.agent_running))
         }
-        Some(AgentStatus::Done { .. }) => ("✓", Style::default().fg(t.agent_done)),
-        Some(AgentStatus::Failed { .. }) => ("✗", Style::default().fg(t.agent_failed)),
-        Some(AgentStatus::Skipped { .. }) => ("⊘", Style::default().fg(t.agent_skipped)),
+        Some(AgentStatus::Done { .. }) => (Cow::Borrowed("✓"), Style::default().fg(t.agent_done)),
+        Some(AgentStatus::Failed { .. }) => (Cow::Borrowed("✗"), Style::default().fg(t.agent_failed)),
+        Some(AgentStatus::Skipped { .. }) => (Cow::Borrowed("⊘"), Style::default().fg(t.agent_skipped)),
     };
 
     let detail = match status {

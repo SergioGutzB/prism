@@ -185,6 +185,12 @@ pub struct App {
     pub setup_saving: bool,
     /// CONTRIBUTING.md or PR template fetched from the current repo (if available).
     pub project_conventions: Option<String>,
+    /// Pre-rendered markdown lines for the current PR description. Populated once
+    /// on PrLoaded/ConfigReloaded so render_description never re-parses per frame.
+    pub pr_description_md_cache: Option<Vec<ratatui::text::Line<'static>>>,
+    /// Pre-computed side-by-side split diff rows. Populated once on DiffLoaded
+    /// so render_split never re-parses the full diff on every frame.
+    pub split_diff_cache: Option<Vec<crate::ui::components::diff_view::SplitLine>>,
 }
 
 impl App {
@@ -265,6 +271,8 @@ impl App {
             setup_field: SetupField::Owner,
             setup_saving: false,
             project_conventions: None,
+            pr_description_md_cache: None,
+            split_diff_cache: None,
         }
     }
 

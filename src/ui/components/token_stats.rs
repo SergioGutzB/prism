@@ -21,15 +21,14 @@ fn days_for_range(range: u8) -> Option<i64> {
     }
 }
 
-fn filtered_stats(stats: &ModelStats, days: Option<i64>) -> (u64, u64, u64) {
-    match days {
+/// Filter model stats by an already-computed cutoff date string ("YYYY-MM-DD").
+/// Pass `None` to sum all time.
+fn filtered_stats(stats: &ModelStats, cutoff: Option<&str>) -> (u64, u64, u64) {
+    match cutoff {
         None => (stats.calls, stats.input_tokens, stats.output_tokens),
-        Some(d) => {
-            let cutoff = (chrono::Utc::now() - chrono::Duration::days(d))
-                .format("%Y-%m-%d")
-                .to_string();
+        Some(cutoff_str) => {
             stats.daily.iter()
-                .filter(|(day, _)| day.as_str() >= cutoff.as_str())
+                .filter(|(day, _)| day.as_str() >= cutoff_str)
                 .fold((0u64, 0u64, 0u64), |acc, (_, ds)| {
                     (acc.0 + ds.calls, acc.1 + ds.input_tokens, acc.2 + ds.output_tokens)
                 })
@@ -52,6 +51,15 @@ pub fn render_stats(frame: &mut Frame, app: &App) {
     let days = days_for_range(app.stats_range);
     let label = range_label(app.stats_range);
 
+    // Compute the cutoff string once — used for every model in the loop below.
+    // Previously this was recomputed inside filtered_stats() for every model.
+    let cutoff_string = days.map(|d| {
+        (chrono::Utc::now() - chrono::Duration::days(d))
+            .format("%Y-%m-%d")
+            .to_string()
+    });
+    let cutoff = cutoff_string.as_deref();
+
     let mut items = vec![
         ListItem::new(Line::from(vec![
             Span::styled(" Range: ", Style::default().fg(t.muted)),
@@ -70,7 +78,7 @@ pub fn render_stats(frame: &mut Frame, app: &App) {
     models.sort_by_key(|(k, _)| k.as_str());
 
     for (model, stats) in &models {
-        let (calls, input_tokens, output_tokens) = filtered_stats(stats, days);
+        let (calls, input_tokens, output_tokens) = filtered_stats(stats, cutoff);
         total_calls += calls;
         total_in += input_tokens;
         total_out += output_tokens;

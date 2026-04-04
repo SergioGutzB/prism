@@ -88,6 +88,11 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_header(frame, app, chunks[0], &t);
 
+    // Compute threaded list once per frame and pass it to sub-renderers.
+    // Previously threaded_comments() was called 4x per frame (render_comment_list,
+    // render_detail x2, visible_comment_count). Now it runs exactly once.
+    let threaded = threaded_comments(app);
+
     // Split body: list (40%) | detail (60%)
     let body_chunks = Layout::horizontal([
         Constraint::Percentage(40),
@@ -95,8 +100,8 @@ pub fn render(frame: &mut Frame, app: &App) {
     ])
     .split(chunks[1]);
 
-    render_comment_list(frame, app, body_chunks[0], &t);
-    render_detail(frame, app, body_chunks[1], &t);
+    render_comment_list(frame, app, body_chunks[0], &t, &threaded);
+    render_detail(frame, app, body_chunks[1], &t, &threaded);
 
     let pane_hint = if app.double_check_pane == 0 {
         ("[Tab]", "→ Detail")
@@ -267,7 +272,13 @@ pub fn comment_at(app: &App, visual_idx: usize) -> Option<(usize, &crate::review
         .map(|(orig, c, _)| (orig, c))
 }
 
-fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
+fn render_comment_list<'a>(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    t: &Theme,
+    comments: &'a [(usize, &'a crate::review::models::GeneratedComment, usize)],
+) {
     let focused = app.double_check_pane == 0;
     let border_style = if focused {
         Style::default().fg(t.border_focused).add_modifier(Modifier::BOLD)
@@ -275,8 +286,6 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         Style::default().fg(t.border)
     };
     let border_color = if focused { t.border_focused } else { t.border };
-
-    let comments = threaded_comments(app);
 
     if comments.is_empty() {
         let msg = if app.draft.as_ref().map(|d| d.comments.is_empty()).unwrap_or(true) {
@@ -301,7 +310,7 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     // Build reply-count map for root comments
     let reply_counts: std::collections::HashMap<u64, usize> = {
         let mut m = std::collections::HashMap::new();
-        for (_, c, depth) in &comments {
+        for (_, c, depth) in comments.iter() {
             if *depth > 0 {
                 if let Some(pid) = c.parent_github_id {
                     *m.entry(pid).or_insert(0usize) += 1;
@@ -413,7 +422,13 @@ fn render_comment_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     }
 }
 
-fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
+fn render_detail<'a>(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    t: &Theme,
+    threaded: &'a [(usize, &'a crate::review::models::GeneratedComment, usize)],
+) {
     let focused = app.double_check_pane == 1;
     let border_style = if focused {
         Style::default().fg(t.border_focused).add_modifier(Modifier::BOLD)
@@ -422,7 +437,9 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     };
     let border_color = if focused { t.border_focused } else { t.border };
 
-    let selected_comment = comment_at(app, app.double_check_selected).map(|(_, c)| c);
+    let selected_comment = threaded
+        .get(app.double_check_selected)
+        .map(|(_, c, _)| *c);
 
     let comment = match selected_comment {
         Some(c) => c,
@@ -470,11 +487,10 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     };
 
     // Determine if this comment is part of a thread (root with replies, or a reply)
-    let all_threaded = threaded_comments(app);
     let thread_root_gh_id: Option<u64> = if comment.parent_github_id.is_some() {
         comment.parent_github_id
     } else if comment.github_id.is_some()
-        && all_threaded.iter().any(|(_, c, _)| c.parent_github_id == comment.github_id)
+        && threaded.iter().any(|(_, c, _)| c.parent_github_id == comment.github_id)
     {
         comment.github_id
     } else {
@@ -483,7 +499,7 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
 
     // Collect the full thread (root + replies in order) when applicable
     let thread: Vec<&crate::review::models::GeneratedComment> = if let Some(root_id) = thread_root_gh_id {
-        all_threaded
+        threaded
             .iter()
             .filter(|(_, c, _)| c.github_id == Some(root_id) || c.parent_github_id == Some(root_id))
             .map(|(_, c, _)| *c)

@@ -142,23 +142,23 @@ fn render_task_list(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
 fn render_task_output(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let task = app.fix_tasks.get(app.fix_task_selected);
 
-    let (title, content) = match task {
-        None => ("Output".to_string(), String::new()),
+    // Avoid cloning the output string — borrow it directly for rendering.
+    let spinner_str;
+    let (title, content): (String, &str) = match task {
+        None => ("Output".to_string(), ""),
         Some(t_info) => {
-            let title = format!(
-                " {} @ {} ",
-                t_info.source, t_info.location
-            );
-            let content = if t_info.output.is_empty() {
+            let title = format!(" {} @ {} ", t_info.source, t_info.location);
+            let content: &str = if t_info.output.is_empty() {
                 if matches!(t_info.status, FixTaskStatus::Running) {
-                    format!("  {} Waiting for Claude…", app.spinner_char())
+                    spinner_str = format!("  {} Waiting for Claude…", app.spinner_char());
+                    &spinner_str
                 } else if matches!(t_info.status, FixTaskStatus::Pending) {
-                    "  Queued".to_string()
+                    "  Queued"
                 } else {
-                    String::new()
+                    ""
                 }
             } else {
-                t_info.output.clone()
+                &t_info.output
             };
             (title, content)
         }
@@ -174,15 +174,14 @@ fn render_task_output(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines: Vec<Line> = content.lines()
-        .map(|l| Line::from(l.to_string()))
-        .collect();
-    let total_lines = lines.len();
+    // Count lines without allocating — only needed for scroll bounds and scrollbar.
+    let total_lines = content.lines().count();
     let inner_h = inner.height as usize;
     let scroll = app.claude_output_scroll.min(total_lines.saturating_sub(1));
 
+    // Paragraph accepts &str directly — no per-line String allocation.
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(content)
             .wrap(Wrap { trim: false })
             .scroll((scroll as u16, 0))
             .style(Style::default().fg(t.foreground).bg(t.background)),

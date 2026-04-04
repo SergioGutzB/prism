@@ -165,7 +165,11 @@ fn render_description(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .unwrap_or("No description.");
 
     let total_lines = body.lines().count();
-    let md_lines = markdown::parse(body, t);
+    // Use the pre-rendered cache (populated once on PrLoaded) to avoid re-parsing
+    // markdown on every frame. Fall back to on-the-fly parsing only if cache is absent.
+    let md_lines = app.pr_description_md_cache
+        .clone()
+        .unwrap_or_else(|| markdown::parse(body, t));
     let para = Paragraph::new(md_lines)
         .block(block)
         .wrap(Wrap { trim: false })
