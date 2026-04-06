@@ -117,6 +117,11 @@ pub struct LlmConfig {
     pub api_key: String,
     #[serde(default)]
     pub base_url: String,
+    /// Ollama context window size (num_ctx). 0 = use Ollama server default.
+    /// Increase this if you see "truncating input prompt" warnings in the Ollama log.
+    /// The model's max is shown as n_ctx_train in the log (e.g. 32768 for qwen2.5-coder).
+    #[serde(default)]
+    pub ollama_num_ctx: u32,
 }
 
 impl LlmConfig {

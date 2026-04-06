@@ -271,10 +271,10 @@ fn help_for_screen(screen: &Screen) -> ScreenHelp {
                 "You can also set GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO env vars",
             ],
         },
-        &Screen::ClaudeCodeOutput => ScreenHelp {
-            title: "Claude Code Output",
+        &Screen::AiFixOutput => ScreenHelp {
+            title: "AI Fix Output",
             icon: "✦",
-            overview: "Claude Code's analysis and suggested fixes for the review comments.",
+            overview: "AI-generated analysis and suggested fixes for the review comments.",
             actions: vec![
                 HelpEntry { key: "j / k",   desc: "Scroll down / up" },
                 HelpEntry { key: "G",        desc: "Go to bottom" },

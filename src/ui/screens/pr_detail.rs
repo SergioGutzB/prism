@@ -14,10 +14,31 @@ pub fn render(frame: &mut Frame, app: &App) {
         area,
     );
 
+    let llm_hint = if app.config.is_llm_configured() {
+        ("[r]", "Review")
+    } else {
+        ("[r]", "Review (unavail)")
+    };
+    let fullscreen_hint = if app.diff_fullscreen { ("[z]", "Exit full") } else { ("[z]", "Full diff") };
+    let split_hint = if app.diff_fullscreen {
+        if app.diff_split_mode { ("[Z]", "Unified") } else { ("[Z]", "Split") }
+    } else { ("[Z]", "Split") };
+    let review_count = app.draft.as_ref()
+        .map(|d| d.comments.iter().filter(|c| c.parent_github_id.is_none()).count())
+        .unwrap_or(0);
+    let reviews_label: String = if review_count > 0 { format!("Reviews({})", review_count) } else { "Reviews".to_string() };
+    let bar_hints: &[(&str, &str)] = &[
+        ("[Esc]", "Back"), llm_hint, ("[c]", "Comment"),
+        ("[v]", reviews_label.as_str()), ("[f]", "Files"),
+        ("[o]", "Browser"), ("[Tab]", "Pane"), ("[jk]", "Scroll"),
+        fullscreen_hint, split_hint, ("[?]", "Help"),
+    ];
+    let bar_h = keybind_bar::height_for(bar_hints, area.width);
+
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(3),
+        Constraint::Length(bar_h),
     ])
     .split(area);
 
@@ -53,52 +74,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
     }
 
-    let llm_hint = if app.config.is_llm_configured() {
-        ("[r]", "Review")
-    } else {
-        ("[r]", "Review (unavail)")
-    };
-
-    let fullscreen_hint = if app.diff_fullscreen {
-        ("[z]", "Exit full")
-    } else {
-        ("[z]", "Full diff")
-    };
-
-    let split_hint = if app.diff_fullscreen {
-        if app.diff_split_mode { ("[Z]", "Unified") } else { ("[Z]", "Split") }
-    } else {
-        ("[Z]", "Split")
-    };
-
-    // Count root-level comments only (no replies) — matches GitHub's "Conversations" count.
-    let review_count = app.draft.as_ref()
-        .map(|d| d.comments.iter().filter(|c| c.parent_github_id.is_none()).count())
-        .unwrap_or(0);
-    let reviews_label: String = if review_count > 0 {
-        format!("Reviews({})", review_count)
-    } else {
-        "Reviews".to_string()
-    };
-
-    keybind_bar::render(
-        frame,
-        chunks[2],
-        &[
-            ("[Esc]", "Back"),
-            llm_hint,
-            ("[c]", "Comment"),
-            ("[v]", reviews_label.as_str()),
-            ("[f]", "Files"),
-            ("[o]", "Browser"),
-            ("[Tab]", "Pane"),
-            ("[jk]", "Scroll"),
-            fullscreen_hint,
-            split_hint,
-            ("[?]", "Help"),
-        ],
-        &t,
-    );
+    keybind_bar::render(frame, chunks[2], bar_hints, &t);
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {

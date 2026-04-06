@@ -23,7 +23,7 @@ pub enum Screen {
     AgentConfig,
     AgentWizard,
     Settings,
-    ClaudeCodeOutput,
+    AiFixOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,8 +178,8 @@ pub struct App {
     pub editing_comment_id: Option<uuid::Uuid>,
     pub fix_tasks: Vec<FixTask>,
     pub fix_task_selected: usize,
-    pub claude_output_scroll: usize,
-    pub claude_output_loading: bool,
+    pub ai_fix_scroll: usize,
+    pub ai_fix_loading: bool,
     pub setup_gh_token: String,
     pub setup_owner: String,
     pub setup_repo: String,
@@ -266,8 +266,8 @@ impl App {
             editing_comment_id: None,
             fix_tasks: Vec::new(),
             fix_task_selected: 0,
-            claude_output_scroll: 0,
-            claude_output_loading: false,
+            ai_fix_scroll: 0,
+            ai_fix_loading: false,
             setup_gh_token: String::new(),
             setup_owner: String::new(),
             setup_repo: String::new(),

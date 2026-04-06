@@ -20,7 +20,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(3),
+        Constraint::Min(3),
     ])
     .split(area);
 
@@ -41,7 +41,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .filter(|t| matches!(t.status, FixTaskStatus::Failed(_)))
         .count();
 
-    let status = if app.claude_output_loading {
+    let status = if app.ai_fix_loading {
         let running_name = app.fix_tasks.iter()
             .find(|t| matches!(t.status, FixTaskStatus::Running))
             .map(|t| format!(" — applying fix {}/{}…", t.index, total))
@@ -177,7 +177,7 @@ fn render_task_output(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     // Count lines without allocating — only needed for scroll bounds and scrollbar.
     let total_lines = content.lines().count();
     let inner_h = inner.height as usize;
-    let scroll = app.claude_output_scroll.min(total_lines.saturating_sub(1));
+    let scroll = app.ai_fix_scroll.min(total_lines.saturating_sub(1));
 
     // Paragraph accepts &str directly — no per-line String allocation.
     frame.render_widget(
@@ -217,7 +217,7 @@ fn render_keybinds(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     if total_lines_for_scroll(app) > 0 {
         hints.push(("[J/K]", "Scroll output"));
     }
-    if selected_failed && !app.claude_output_loading {
+    if selected_failed && !app.ai_fix_loading {
         hints.push(("[C]", "Retry task"));
     }
     keybind_bar::render(frame, area, &hints, t);

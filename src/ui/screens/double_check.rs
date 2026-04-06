@@ -79,29 +79,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         area,
     );
 
-    let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(0),
-        Constraint::Length(3),
-    ])
-    .split(area);
-
-    render_header(frame, app, chunks[0], &t);
-
-    // Compute threaded list once per frame and pass it to sub-renderers.
-    // Previously threaded_comments() was called 4x per frame (render_comment_list,
-    // render_detail x2, visible_comment_count). Now it runs exactly once.
+    // Build hints first so we can compute the keybind bar height before layout.
     let threaded = threaded_comments(app);
-
-    // Split body: list (40%) | detail (60%)
-    let body_chunks = Layout::horizontal([
-        Constraint::Percentage(40),
-        Constraint::Percentage(60),
-    ])
-    .split(chunks[1]);
-
-    render_comment_list(frame, app, body_chunks[0], &t, &threaded);
-    render_detail(frame, app, body_chunks[1], &t, &threaded);
 
     let pane_hint = if app.double_check_pane == 0 {
         ("[Tab]", "→ Detail")
@@ -111,8 +90,6 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let fix_label = format!("Fix with {}", app.config.llm.provider);
 
-    // Show context-sensitive hints depending on whether the selected comment is
-    // already published on GitHub (github_id present) or a new local comment.
     let selected_is_github = threaded
         .get(app.double_check_selected)
         .map(|(_, c, _)| c.github_id.is_some())
@@ -139,6 +116,26 @@ pub fn render(frame: &mut Frame, app: &App) {
     hints.push(("[F]", &fix_label));
     hints.push(("[1-7]", "Filter agent"));
     hints.push(("[?]", "Help"));
+
+    let bar_h = keybind_bar::height_for(&hints, area.width);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(bar_h),
+    ])
+    .split(area);
+
+    render_header(frame, app, chunks[0], &t);
+
+    let body_chunks = Layout::horizontal([
+        Constraint::Percentage(40),
+        Constraint::Percentage(60),
+    ])
+    .split(chunks[1]);
+
+    render_comment_list(frame, app, body_chunks[0], &t, &threaded);
+    render_detail(frame, app, body_chunks[1], &t, &threaded);
 
     keybind_bar::render(frame, chunks[2], &hints, &t);
 }

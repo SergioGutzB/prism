@@ -43,11 +43,16 @@ max_tokens = 8192
 temperature = 0.2
 # api_key = ""     # overrides env var; leave empty to use ANTHROPIC_API_KEY etc.
 # base_url = ""    # custom endpoint (Azure OpenAI, custom Ollama host, etc.)
+# ollama_num_ctx = 16384  # Ollama context window (tokens). Set this if you see
+#                         # "truncating input prompt" in the Ollama server log.
+#                         # Must be <= the model's n_ctx_train (shown in Ollama logs).
+#                         # Recommended for qwen2.5-coder:14b: 16384 or 32768.
+ollama_num_ctx = 16384
 
 [agents]
 agents_dir = "~/.config/prism/agents"
-concurrency = 2
-timeout_secs = 300
+concurrency = 1
+timeout_secs = 600
 
 # Files matching these glob patterns are excluded from every agent's diff.
 # Patterns are matched against the full path and every sub-path (so "dist/*"

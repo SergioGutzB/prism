@@ -307,6 +307,26 @@ async fn main() -> Result<()> {
                     AppEvent::ConventionsLoaded(conventions) => {
                         app.project_conventions = conventions;
                     }
+                    AppEvent::FixTaskChunk(idx, chunk) => {
+                        if let Some(task) = app.fix_tasks.iter_mut().find(|t| t.index == idx) {
+                            task.output.push_str(&chunk);
+                            task.status = app::FixTaskStatus::Running;
+                        }
+                    }
+                    AppEvent::FixTaskDone(idx) => {
+                        if let Some(task) = app.fix_tasks.iter_mut().find(|t| t.index == idx) {
+                            task.status = app::FixTaskStatus::Done;
+                        }
+                        app.ai_fix_loading = app.fix_tasks.iter()
+                            .any(|t| matches!(t.status, app::FixTaskStatus::Pending | app::FixTaskStatus::Running));
+                    }
+                    AppEvent::FixTaskFailed(idx, err) => {
+                        if let Some(task) = app.fix_tasks.iter_mut().find(|t| t.index == idx) {
+                            task.status = app::FixTaskStatus::Failed(err);
+                        }
+                        app.ai_fix_loading = app.fix_tasks.iter()
+                            .any(|t| matches!(t.status, app::FixTaskStatus::Pending | app::FixTaskStatus::Running));
+                    }
                     AppEvent::ReviewBodyGenerated(body) => {
                         app.review_body_generating = false;
                         if let Some(draft) = &mut app.draft {
@@ -505,7 +525,7 @@ async fn handle_action(
         Action::Back => {
             if app.input_mode == InputMode::Insert {
                 app.input_mode = InputMode::Normal;
-            } else if app.screen == Screen::AgentRunner && app.agent_abort.is_some() {
+            } else if app.screen == Screen::AgentRunner && app.agent_abort.is_some() && !app.agents_committed {
                 // Jobs are still running — ask what to do
                 app.popup = Some(PopupState {
                     title: "Review in progress".to_string(),
@@ -1083,6 +1103,11 @@ async fn handle_action(
                     .spawn();
             }
         }
+        Action::AiFix => {
+            if app.screen == Screen::DoubleCheck {
+                start_ai_fix(app, event_tx, config);
+            }
+        }
         _ => {}
     }
 }
@@ -1238,6 +1263,8 @@ fn handle_agent_update(
         });
         if all_done && !app.agents_committed {
             app.agents_committed = true;
+            // Clear abort handle — agents finished naturally, no longer "running"
+            app.agent_abort = None;
             if let Some(draft) = &mut app.draft {
                 for status in app.agent_statuses.values() {
                     if let AgentStatus::Done { comments, .. } = status {
@@ -1603,6 +1630,98 @@ fn save_agent_to_disk(app: &App) -> Result<std::path::PathBuf> {
     );
     std::fs::write(&file_path, content)?;
     Ok(file_path)
+}
+
+fn start_ai_fix(
+    app: &mut App,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+    config: &config::AppConfig,
+) {
+    use app::{FixTask, FixTaskStatus};
+
+    // Collect approved/pending comments that have a file location — those are fixable
+    let comments: Vec<_> = app.draft.as_ref()
+        .map(|d| d.submittable_comments()
+            .into_iter()
+            .filter(|c| c.file_path.is_some() && c.github_id.is_none())
+            .cloned()
+            .collect())
+        .unwrap_or_default();
+
+    if comments.is_empty() {
+        app.show_info("No fixable comments", "Approve some AI-generated inline comments first.\nComments need a file path to be auto-fixed.");
+        return;
+    }
+
+    let diff = app.current_diff.clone().unwrap_or_default();
+    let pr_title = app.current_pr.as_ref().map(|p| p.title.clone()).unwrap_or_default();
+
+    // Build fix tasks
+    app.fix_tasks = comments.iter().enumerate().map(|(i, c)| {
+        let file = c.file_path.clone().unwrap_or_default();
+        let line = c.line.unwrap_or(0);
+        let body = c.effective_body().to_string();
+        let severity = format!("{}", c.severity);
+
+        let prompt = format!(
+            "PR: {pr_title}\n\n\
+            You are reviewing a code fix request.\n\
+            File: {file} (line {line})\n\
+            Issue [{severity}]: {body}\n\n\
+            Based on the diff below, suggest a concrete fix for this issue.\n\
+            Be specific — show the exact code change needed.\n\n\
+            ```diff\n{diff}\n```",
+            diff = if diff.len() > 6000 { &diff[..6000] } else { &diff }
+        );
+
+        FixTask {
+            index: i,
+            location: format!("{}:{}", file, line),
+            source: format!("[{}]", severity),
+            summary: body.chars().take(60).collect(),
+            status: FixTaskStatus::Pending,
+            output: String::new(),
+            prompt,
+        }
+    }).collect();
+
+    app.fix_task_selected = 0;
+    app.ai_fix_scroll = 0;
+    app.ai_fix_loading = true;
+    app.navigate_to(Screen::AiFixOutput);
+
+    // Spawn one task per fix sequentially via channel
+    let tx = event_tx.clone();
+    let llm = config.llm.clone();
+    let tasks: Vec<_> = app.fix_tasks.iter().map(|t| (t.index, t.prompt.clone())).collect();
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let system = "You are a senior developer. Suggest a concise, specific fix for the reported code issue. \
+            Show the exact code change. Be brief and practical.";
+
+        for (idx, prompt) in tasks {
+            let _ = tx.send(AppEvent::FixTaskChunk(idx, String::new())); // mark as Running
+
+            let model = llm.model.clone();
+            let result = agents::runner::call_provider(
+                &client, &llm, &model,
+                0.2, 1024,
+                system, &prompt,
+                300, "ai-fix",
+            ).await;
+
+            match result {
+                Ok(response) => {
+                    let _ = tx.send(AppEvent::FixTaskChunk(idx, response));
+                    let _ = tx.send(AppEvent::FixTaskDone(idx));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::FixTaskFailed(idx, e.to_string()));
+                }
+            }
+        }
+    });
 }
 
 fn init_tracing() -> Option<()> {

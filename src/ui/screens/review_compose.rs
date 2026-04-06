@@ -19,7 +19,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Constraint::Length(3),
         Constraint::Min(0),
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Min(3),
     ])
     .split(area);
 
