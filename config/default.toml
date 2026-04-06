@@ -25,16 +25,20 @@ key_patterns = ["[a-z]+-[0-9]+"]
 #   "openai"      OpenAI Chat Completions → set OPENAI_API_KEY
 #   "gemini"      Google Gemini API       → set GEMINI_API_KEY or GOOGLE_API_KEY
 #   "ollama"      Local Ollama server     → no key needed (default: localhost:11434)
-provider = "claude-cli"
+# provider = "claude-cli"
 # provider = "gemini"
+provider = "ollama"
 
 # Model name for the selected provider, e.g.:
 #   anthropic : "claude-opus-4-6" | "claude-sonnet-4-6" | "claude-haiku-4-5"
 #   openai    : "gpt-4o" | "gpt-4-turbo" | "o3"
 #   gemini    : "gemini-1.5-pro" | "gemini-1.5-flash" | "gemini-2.0-flash" | "gemini-flash-latest"
 # ollama    : "llama3.2" | "codellama" | "deepseek-coder"
-model = "claude-opus-4-6"
+# model = "claude-opus-4-6"
 # model    = "gemini-flash-latest"
+model = "qwen2.5-coder:14b"
+
+#
 max_tokens = 8192
 temperature = 0.2
 # api_key = ""     # overrides env var; leave empty to use ANTHROPIC_API_KEY etc.

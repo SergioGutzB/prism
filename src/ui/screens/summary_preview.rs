@@ -47,6 +47,11 @@ pub fn render(frame: &mut Frame, app: &App) {
         ("[Tab]", "→ Body")
     };
 
+    let generate_hint = if app.review_body_generating {
+        ("[g]", "Generating…")
+    } else {
+        ("[g]", "Generate body")
+    };
     keybind_bar::render(
         frame,
         chunks[3],
@@ -55,7 +60,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             ("[←→]", "Review type"),
             pane_hint,
             ("[jk]", "Scroll"),
-            ("[g]", "Generate body"),
+            generate_hint,
             ("[Enter/p]", "Submit"),
         ],
         &t,
@@ -85,11 +90,16 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let focused = app.summary_pane == 0;
     let border_color = if focused { t.border_focused } else { t.border };
 
-    let body = app
-        .draft
-        .as_ref()
-        .and_then(|d| d.review_body.as_deref())
-        .unwrap_or("(Empty — press [g] to auto-generate from approved comments, or leave blank to submit only inline comments.)");
+    let generating_str;
+    let body = if app.review_body_generating {
+        generating_str = format!("{}  Generating review body with LLM…", app.spinner_char());
+        &generating_str as &str
+    } else {
+        app.draft
+            .as_ref()
+            .and_then(|d| d.review_body.as_deref())
+            .unwrap_or("(Empty — press [g] to auto-generate from approved comments, or leave blank to submit only inline comments.)")
+    };
 
     let total_lines = body.lines().count().max(1);
     let scroll = app.summary_body_scroll;

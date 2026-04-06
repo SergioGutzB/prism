@@ -307,6 +307,17 @@ async fn main() -> Result<()> {
                     AppEvent::ConventionsLoaded(conventions) => {
                         app.project_conventions = conventions;
                     }
+                    AppEvent::ReviewBodyGenerated(body) => {
+                        app.review_body_generating = false;
+                        if let Some(draft) = &mut app.draft {
+                            draft.review_body = Some(body);
+                        }
+                        save_draft(&app, &config);
+                    }
+                    AppEvent::ReviewBodyFailed(err) => {
+                        app.review_body_generating = false;
+                        app.show_error(format!("Failed to generate review body: {err}"));
+                    }
                     _ => {}
                 }
             }
@@ -667,12 +678,13 @@ async fn handle_action(
         // Review Actions
         Action::GenerateReview => {
             if app.screen == Screen::PrDetail {
-                if has_existing_review(app) {
-                    app.popup = Some(PopupState {
-                        title: "Existing Review Found".to_string(),
-                        message: "This PR already has review comments.\n[Enter] Discard & restart  |  [Esc] Keep existing".to_string(),
-                        kind: PopupKind::ConfirmRestart,
-                    });
+                if has_existing_local_review(app) {
+                    // Already have unpublished AI/manual comments — go straight to DoubleCheck
+                    // so the user can manage them. From there, [R] re-runs the agents if needed.
+                    if let (Some(draft), Some(diff)) = (&mut app.draft, &app.current_diff.clone()) {
+                        populate_checklist_from_diff(draft, diff);
+                    }
+                    app.navigate_to(Screen::DoubleCheck);
                 } else {
                     start_agent_runner(app, config);
                 }
@@ -704,7 +716,7 @@ async fn handle_action(
             }
         }
         Action::GenerateBody => {
-            // [g] key — edit selected comment in DoubleCheck
+            // [g] in DoubleCheck — edit selected comment
             if app.screen == Screen::DoubleCheck {
                 if let Some((_, comment)) =
                     ui::screens::double_check::comment_at(app, app.double_check_selected)
@@ -717,18 +729,72 @@ async fn handle_action(
                     app.navigate_to(Screen::ReviewCompose);
                 }
             }
-        }
-        Action::HybridReview => {
-            if app.screen == Screen::PrDetail {
-                if has_existing_review(app) {
-                    app.popup = Some(PopupState {
-                        title: "Existing Review Found".to_string(),
-                        message: "This PR already has review comments.\n[Enter] Discard & restart  |  [Esc] Keep existing".to_string(),
-                        kind: PopupKind::ConfirmRestart,
-                    });
+            // [g] in SummaryPreview — LLM-generate the review body
+            if app.screen == Screen::SummaryPreview && !app.review_body_generating {
+                let comments: Vec<String> = app.draft.as_ref()
+                    .map(|d| d.submittable_comments()
+                        .iter()
+                        .map(|c| {
+                            let file = c.file_path.as_deref().unwrap_or("(general)");
+                            let line = c.line.map(|l| format!(":{l}")).unwrap_or_default();
+                            format!("[{}] {}{} — {}", c.severity, file, line, c.effective_body())
+                        })
+                        .collect())
+                    .unwrap_or_default();
+
+                if comments.is_empty() {
+                    app.show_info("No comments", "Approve some comments first before generating a review body.");
                 } else {
-                    start_agent_runner(app, config);
+                    let pr_title = app.current_pr.as_ref().map(|p| p.title.clone()).unwrap_or_default();
+                    let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
+                    app.review_body_generating = true;
+
+                    let tx = event_tx.clone();
+                    let llm = config.llm.clone();
+                    let client = reqwest::Client::new();
+                    tokio::spawn(async move {
+                        let system = "You are a senior code reviewer writing the top-level summary of a GitHub pull request review. \
+                            Be concise, professional, and constructive. \
+                            Write plain text (no markdown fences). \
+                            Focus on the overall quality, patterns found, and the most important issues.";
+
+                        let comment_list = comments.join("\n");
+                        let prompt = format!(
+                            "PR #{pr_num}: {pr_title}\n\n\
+                            The following inline comments were found during review:\n\
+                            {comment_list}\n\n\
+                            Write a concise review summary (2-4 paragraphs) that: \
+                            1) States the overall quality and what the PR does, \
+                            2) Highlights the most critical issues found, \
+                            3) Mentions any positive aspects, \
+                            4) Gives a clear recommendation (approve / request changes)."
+                        );
+
+                        let model = llm.model.clone();
+                        let result = agents::runner::call_provider(
+                            &client, &llm, &model,
+                            0.3, 1024,
+                            system, &prompt,
+                            60, "review-body-gen",
+                        ).await;
+
+                        match result {
+                            Ok(body) => { let _ = tx.send(AppEvent::ReviewBodyGenerated(body)); }
+                            Err(e)   => { let _ = tx.send(AppEvent::ReviewBodyFailed(e.to_string())); }
+                        }
+                    });
                 }
+            }
+        }
+        Action::RestartReview => {
+            // [R] from DoubleCheck or PrDetail — confirm before discarding local AI comments
+            // and re-running all agents.
+            if app.screen == Screen::DoubleCheck || app.screen == Screen::PrDetail {
+                app.popup = Some(PopupState {
+                    title: "Restart Review".to_string(),
+                    message: "Discard all local AI comments and re-run the agents?\n\nExisting GitHub comments are preserved.\n[Enter] Restart  |  [Esc] Cancel".to_string(),
+                    kind: PopupKind::ConfirmRestart,
+                });
             }
         }
         Action::OpenDoubleCheck => {
@@ -844,6 +910,8 @@ async fn handle_action(
             if app.screen == Screen::DoubleCheck {
                 if let Some(draft) = &mut app.draft {
                     for c in &mut draft.comments {
+                        // Skip already-published GitHub comments — their status is irrelevant
+                        if c.github_id.is_some() { continue; }
                         if c.status != review::models::CommentStatus::Approved {
                             c.status = review::models::CommentStatus::Approved;
                         }
@@ -855,6 +923,8 @@ async fn handle_action(
             if app.screen == Screen::DoubleCheck {
                 if let Some(draft) = &mut app.draft {
                     for c in &mut draft.comments {
+                        // Skip already-published GitHub comments — use [Del/-] to remove them
+                        if c.github_id.is_some() { continue; }
                         c.status = review::models::CommentStatus::Rejected;
                     }
                 }
@@ -1072,11 +1142,14 @@ fn diff_cursor_location(lines: &[String], cursor: usize) -> (Option<String>, Opt
     (file, None)
 }
 
-fn has_existing_review(app: &App) -> bool {
+/// Returns true only if there are locally-generated (AI or manual) comments that
+/// haven't been published yet. GitHub-imported comments (github_id present) don't
+/// count — they are always preserved when agents re-run.
+fn has_existing_local_review(app: &App) -> bool {
     let pr_num = app.current_pr.as_ref().map(|p| p.number).unwrap_or(0);
     app.draft
         .as_ref()
-        .map(|d| d.pr_number == pr_num && !d.comments.is_empty())
+        .map(|d| d.pr_number == pr_num && d.comments.iter().any(|c| c.github_id.is_none()))
         .unwrap_or(false)
 }
 
@@ -1322,10 +1395,22 @@ fn start_agent_runner(app: &mut App, config: &config::AppConfig) {
     let mut ctx = ReviewContext::from_pr(&pr, &diff, None, &repo_slug);
     ctx.project_conventions = app.project_conventions.clone();
 
-    app.draft = Some(review::models::ReviewDraft::new(
+    // Preserve comments that already exist on GitHub (loaded from ReviewsLoaded).
+    // Only clear locally-generated AI/manual comments so the user starts fresh
+    // without losing the existing GitHub thread context.
+    let github_comments: Vec<_> = app.draft.as_ref()
+        .map(|d| d.comments.iter().filter(|c| c.github_id.is_some()).cloned().collect())
+        .unwrap_or_default();
+
+    let mut new_draft = review::models::ReviewDraft::new(
         pr.number,
         review::models::ReviewMode::AiOnly,
-    ));
+    );
+    for c in github_comments {
+        new_draft.comments.push(c);
+    }
+    app.draft = Some(new_draft);
+
     if let (Some(draft), Some(diff)) = (&mut app.draft, &app.current_diff) {
         populate_checklist_from_diff(draft, diff);
     }
@@ -1433,6 +1518,11 @@ fn toggle_comment(app: &mut App) {
         ui::screens::double_check::comment_at(app, app.double_check_selected).map(|(i, _)| i);
     if let (Some(idx), Some(draft)) = (orig_idx, &mut app.draft) {
         if let Some(comment) = draft.comments.get_mut(idx) {
+            // GitHub comments are already published — toggling their local status
+            // is meaningless (the publisher skips them anyway). Use [Del/-] to delete.
+            if comment.github_id.is_some() {
+                return;
+            }
             comment.status = match comment.status {
                 CommentStatus::Approved => CommentStatus::Rejected,
                 _ => CommentStatus::Approved,

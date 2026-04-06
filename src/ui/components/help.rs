@@ -54,10 +54,9 @@ fn help_for_screen(screen: &Screen) -> ScreenHelp {
             icon: "🔍",
             overview: "Review a pull request. Three panels: Description (left), Diff (center), Ticket (right). Start an AI review, write a quick comment, or navigate to the file tree for inline comments.",
             actions: vec![
-                HelpEntry { key: "r",     desc: "Start AI-only review" },
-                HelpEntry { key: "H",     desc: "Hybrid review (AI + manual)" },
+                HelpEntry { key: "r",     desc: "Start AI review (preserves existing GitHub comments)" },
                 HelpEntry { key: "c",     desc: "Quick comment (posts directly)" },
-                HelpEntry { key: "v",     desc: "View review session (DoubleCheck)" },
+                HelpEntry { key: "v",     desc: "View / manage review comments" },
                 HelpEntry { key: "f",     desc: "File tree with inline comments" },
                 HelpEntry { key: "o",     desc: "Open PR in browser" },
                 HelpEntry { key: "z",     desc: "Toggle diff fullscreen" },

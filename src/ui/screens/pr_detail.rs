@@ -54,9 +54,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 
     let llm_hint = if app.config.is_llm_configured() {
-        ("[r]", "AI Review")
+        ("[r]", "Review")
     } else {
-        ("[r]", "AI (unavail)")
+        ("[r]", "Review (unavail)")
     };
 
     let fullscreen_hint = if app.diff_fullscreen {
@@ -89,7 +89,6 @@ pub fn render(frame: &mut Frame, app: &App) {
             llm_hint,
             ("[c]", "Comment"),
             ("[v]", reviews_label.as_str()),
-            ("[H]", "Hybrid"),
             ("[f]", "Files"),
             ("[o]", "Browser"),
             ("[Tab]", "Pane"),

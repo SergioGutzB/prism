@@ -165,6 +165,8 @@ pub struct App {
     pub agents_committed: bool,
     pub show_help: bool,
     pub show_stats: bool,
+    /// True while the LLM is generating the review body in SummaryPreview.
+    pub review_body_generating: bool,
 
     // Statistics
     pub stats_range: u8,   // 0 = last 7d, 1 = last 15d, 2 = last 30d, 3 = all time
@@ -257,6 +259,7 @@ impl App {
             agents_committed: false,
             show_help: false,
             show_stats: false,
+            review_body_generating: false,
             stats_range: 3,
             model_stats: HashMap::new(),
             pending_delete_comment: None,

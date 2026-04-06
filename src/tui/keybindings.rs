@@ -121,7 +121,7 @@ pub enum Action {
     PageDown,
     GenerateReview,
     ManualComment,
-    HybridReview,
+
     Publish,
     OpenBrowser,
     Refresh,
@@ -202,9 +202,6 @@ pub fn map_key(key: &KeyEvent, mode: &InputMode) -> Option<Action> {
                 // Review modes
                 KeyCode::Char('r') => Some(Action::GenerateReview),
                 KeyCode::Char('c') => Some(Action::ManualComment),
-                // 'h' is also NavLeft above — override for hybrid:
-                // Use uppercase H for hybrid to avoid clash with vim left
-                KeyCode::Char('H') => Some(Action::HybridReview),
                 // Publish
                 KeyCode::Char('p') => Some(Action::Publish),
                 // Misc
@@ -236,7 +233,7 @@ pub fn map_key(key: &KeyEvent, mode: &InputMode) -> Option<Action> {
                 KeyCode::Char(c @ '1'..='7') => {
                     Some(Action::FilterAgent(c as u8 - b'0'))
                 }
-                KeyCode::Delete => Some(Action::Delete),
+                KeyCode::Delete | KeyCode::Char('-') => Some(Action::Delete),
                 _ => None,
             }
         }
