@@ -17,10 +17,29 @@ pub fn render(frame: &mut Frame, app: &App) {
         area,
     );
 
+    let has_output = app.fix_tasks.get(app.fix_task_selected)
+        .map(|t| !t.output.is_empty())
+        .unwrap_or(false);
+    let selected_done = app.fix_tasks.get(app.fix_task_selected)
+        .map(|t| matches!(t.status, FixTaskStatus::Done))
+        .unwrap_or(false);
+    let selected_failed = app.fix_tasks.get(app.fix_task_selected)
+        .map(|t| matches!(t.status, FixTaskStatus::Failed(_)))
+        .unwrap_or(false);
+    let fullscreen_hint = if app.ai_fix_fullscreen { ("[z]", "Exit full") } else { ("[z]", "Fullscreen") };
+    let mut bar_hints: Vec<(&str, &str)> = vec![
+        ("[Esc]", "Back"), ("[j/k]", "Tasks"), ("[J/K]", "Scroll"), fullscreen_hint,
+    ];
+    if has_output { bar_hints.push(("[y]", "Copy output")); }
+    if selected_done && !app.ai_fix_loading { bar_hints.push(("[e]", "Apply fix")); }
+    if !app.ai_fix_loading { bar_hints.push(("[R]", "Re-run fixes")); }
+    if selected_failed && !app.ai_fix_loading { bar_hints.push(("[C]", "Retry task")); }
+    let bar_h = keybind_bar::height_for(&bar_hints, area.width);
+
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Min(3),
+        Constraint::Length(bar_h),
     ])
     .split(area);
 
@@ -41,16 +60,17 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .filter(|t| matches!(t.status, FixTaskStatus::Failed(_)))
         .count();
 
+    let provider = &app.config.llm.provider;
     let status = if app.ai_fix_loading {
         let running_name = app.fix_tasks.iter()
             .find(|t| matches!(t.status, FixTaskStatus::Running))
             .map(|t| format!(" — applying fix {}/{}…", t.index, total))
             .unwrap_or_default();
-        format!(" {} Claude Fix — PR #{pr_num}{running_name} ", app.spinner_char())
+        format!(" {} AI Fix ({provider}) — PR #{pr_num}{running_name} ", app.spinner_char())
     } else if failed > 0 {
-        format!(" ✦ Claude Fix — PR #{pr_num}  {done} done  {failed} failed ")
+        format!(" ✦ AI Fix ({provider}) — PR #{pr_num}  {done} done  {failed} failed ")
     } else {
-        format!(" ✦ Claude Fix — PR #{pr_num}  {done}/{total} done ")
+        format!(" ✦ AI Fix ({provider}) — PR #{pr_num}  {done}/{total} done ")
     };
 
     frame.render_widget(
@@ -80,6 +100,11 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 .style(Style::default().fg(t.loading)),
             inner,
         );
+        return;
+    }
+
+    if app.ai_fix_fullscreen {
+        render_task_output(frame, app, area, t);
         return;
     }
 
@@ -143,17 +168,23 @@ fn render_task_output(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let task = app.fix_tasks.get(app.fix_task_selected);
 
     // Avoid cloning the output string — borrow it directly for rendering.
+    // Declare all temporaries at this scope so borrows outlive the match block.
     let spinner_str;
+    let failed_str;
     let (title, content): (String, &str) = match task {
         None => ("Output".to_string(), ""),
         Some(t_info) => {
             let title = format!(" {} @ {} ", t_info.source, t_info.location);
             let content: &str = if t_info.output.is_empty() {
                 if matches!(t_info.status, FixTaskStatus::Running) {
-                    spinner_str = format!("  {} Waiting for Claude…", app.spinner_char());
+                    spinner_str = format!("  {} Waiting for LLM…", app.spinner_char());
                     &spinner_str
                 } else if matches!(t_info.status, FixTaskStatus::Pending) {
                     "  Queued"
+                } else if let FixTaskStatus::Failed(ref err) = t_info.status {
+                    // Fallback: error wasn't written to output (shouldn't happen, but be safe)
+                    failed_str = format!("❌ Error: {err}");
+                    &failed_str
                 } else {
                     ""
                 }
@@ -206,20 +237,23 @@ fn render_task_output(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
 // ── Keybind bar ───────────────────────────────────────────────────────────────
 
 fn render_keybinds(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
+    let has_output = app.fix_tasks.get(app.fix_task_selected)
+        .map(|t| !t.output.is_empty())
+        .unwrap_or(false);
+    let selected_done = app.fix_tasks.get(app.fix_task_selected)
+        .map(|t| matches!(t.status, FixTaskStatus::Done))
+        .unwrap_or(false);
     let selected_failed = app.fix_tasks.get(app.fix_task_selected)
         .map(|t| matches!(t.status, FixTaskStatus::Failed(_)))
         .unwrap_or(false);
-
+    let fullscreen_hint = if app.ai_fix_fullscreen { ("[z]", "Exit full") } else { ("[z]", "Fullscreen") };
     let mut hints: Vec<(&str, &str)> = vec![
-        ("[Esc]", "Back"),
-        ("[j/k]", "Navigate"),
+        ("[Esc]", "Back"), ("[j/k]", "Tasks"), ("[J/K]", "Scroll"), fullscreen_hint,
     ];
-    if total_lines_for_scroll(app) > 0 {
-        hints.push(("[J/K]", "Scroll output"));
-    }
-    if selected_failed && !app.ai_fix_loading {
-        hints.push(("[C]", "Retry task"));
-    }
+    if has_output { hints.push(("[y]", "Copy output")); }
+    if selected_done && !app.ai_fix_loading { hints.push(("[e]", "Apply fix")); }
+    if !app.ai_fix_loading { hints.push(("[R]", "Re-run fixes")); }
+    if selected_failed && !app.ai_fix_loading { hints.push(("[C]", "Retry task")); }
     keybind_bar::render(frame, area, &hints, t);
 }
 

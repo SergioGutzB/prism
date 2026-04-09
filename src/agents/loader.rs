@@ -125,6 +125,11 @@ struct AgentFrontmatter {
     #[serde(default)]
     llm: Option<AgentLlmOverride>,
     context: AgentContext,
+    /// Per-agent minimum severity override. When set, discards comments below
+    /// this threshold regardless of the global `review_rigor` setting.
+    /// Accepts: "praise" | "suggestion" | "warning" | "critical"
+    #[serde(default)]
+    min_severity: Option<String>,
 }
 
 /// Parse a Markdown agent file into an `AgentDefinition`.
@@ -186,6 +191,7 @@ fn parse_agent_md(source: &str) -> Result<AgentDefinition> {
             synthesis: fm.synthesis,
             llm: fm.llm,
             context: fm.context,
+            min_severity: fm.min_severity,
             prompt: AgentPrompt { system, prompt_suffix },
         },
     })

@@ -214,7 +214,10 @@ impl AgentRunner {
         let output_tokens = (raw_response.len() / 4) as u64;
 
         match self.parse_response(agent, &raw_response) {
-            Ok(comments) => Ok((comments, input_tokens, output_tokens)),
+            Ok(comments) => {
+                let filtered = self.apply_severity_filter(agent, comments);
+                Ok((filtered, input_tokens, output_tokens))
+            }
             Err(parse_err) => {
                 warn!(agent_id = %agent.agent.id, "First parse attempt failed ({}), retrying", parse_err);
                 // Include the expected schema in the retry to help models that drifted
@@ -238,7 +241,52 @@ Use null for file_path and line when the comment is general."#
                 let retry_out = (retry_response.len() / 4) as u64;
                 let comments = self.parse_response(agent, &retry_response)
                     .context("JSON parse failed after retry")?;
-                Ok((comments, input_tokens + retry_in, output_tokens + retry_out))
+                let filtered = self.apply_severity_filter(agent, comments);
+                Ok((filtered, input_tokens + retry_in, output_tokens + retry_out))
+            }
+        }
+    }
+
+    /// Post-generation safety net: discard comments that fall below the effective
+    /// minimum severity for this agent. The LLM rigor instruction is the primary
+    /// gate; this filter catches the cases where the model ignores it.
+    ///
+    /// The effective threshold is resolved as:
+    ///   agent `min_severity` (frontmatter) > global `review_rigor` > no filter
+    ///
+    /// Summary and objective agents are exempt — their comments carry structural
+    /// meaning (overall verdict) that should never be filtered by rigor level.
+    fn apply_severity_filter(
+        &self,
+        agent: &AgentDefinition,
+        comments: Vec<GeneratedComment>,
+    ) -> Vec<GeneratedComment> {
+        // Exempt structural agents from severity filtering
+        if matches!(agent.agent.id.as_str(), "summary" | "objective") {
+            return comments;
+        }
+
+        let global_min = self.config.agents.min_severity_for_rigor();
+        let min = agent.agent.effective_min_severity(global_min.as_ref());
+
+        match min {
+            None => comments,
+            Some(threshold) => {
+                let before = comments.len();
+                let filtered: Vec<_> = comments
+                    .into_iter()
+                    .filter(|c| c.severity >= threshold)
+                    .collect();
+                let dropped = before - filtered.len();
+                if dropped > 0 {
+                    debug!(
+                        agent_id = %agent.agent.id,
+                        dropped,
+                        threshold = %threshold,
+                        "Rigor filter dropped comments below severity threshold",
+                    );
+                }
+                filtered
             }
         }
     }
@@ -332,18 +380,24 @@ Use null for file_path and line when the comment is general."#
 
             parts.push(diff_section);
         }
+
+        // Inject the rigor instruction immediately before the prompt suffix so the
+        // model reads it as the last constraint before generating output — the most
+        // influential position. Agents with `min_severity` set in their frontmatter
+        // skip the global rigor instruction; the post-generation filter still applies.
+        if agent.agent.min_severity.is_none() {
+            if let Some(instruction) = self.config.agents.rigor_instruction() {
+                parts.push(instruction.to_string());
+            }
+        }
+
         parts.push(agent.agent.prompt.prompt_suffix.clone());
         parts.join("\n\n")
     }
 
     /// Dispatch to the right LLM backend based on `config.llm.provider`.
     async fn call_llm(&self, agent: &AgentDefinition, prompt: &str) -> Result<String> {
-        let rigor_prefix = self.config.agents.rigor_prefix();
-        let system = if rigor_prefix.is_empty() {
-            agent.agent.prompt.system.clone()
-        } else {
-            format!("{}{}", rigor_prefix, agent.agent.prompt.system)
-        };
+        let system = agent.agent.prompt.system.clone();
 
         // Per-agent model/temperature override (if defined in agent YAML)
         let model = agent.agent.llm.as_ref()
