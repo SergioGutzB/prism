@@ -592,6 +592,11 @@ async fn handle_action(
                 app.agent_config_selected =
                     (app.agent_config_selected + 1).min(app.agents.len().saturating_sub(1));
             }
+            Screen::AiFixOutput => {
+                app.fix_task_selected =
+                    (app.fix_task_selected + 1).min(app.fix_tasks.len().saturating_sub(1));
+                app.ai_fix_scroll = 0;
+            }
             _ => {}
         },
         Action::NavUp => match app.screen {
@@ -622,6 +627,10 @@ async fn handle_action(
             }
             Screen::AgentConfig => {
                 app.agent_config_selected = app.agent_config_selected.saturating_sub(1);
+            }
+            Screen::AiFixOutput => {
+                app.fix_task_selected = app.fix_task_selected.saturating_sub(1);
+                app.ai_fix_scroll = 0;
             }
             _ => {}
         },
@@ -677,6 +686,8 @@ async fn handle_action(
                     app.file_tree_split = false;
                 }
                 app.file_tree_scroll = 0;
+            } else if app.screen == Screen::AiFixOutput {
+                app.ai_fix_fullscreen = !app.ai_fix_fullscreen;
             }
         }
         Action::ToggleSplitDiff => {
@@ -807,6 +818,11 @@ async fn handle_action(
             }
         }
         Action::RestartReview => {
+            if app.screen == Screen::AiFixOutput {
+                // [R] from AiFixOutput: force re-run the fixes
+                start_ai_fix(app, event_tx, config);
+                return;
+            }
             // [R] from DoubleCheck or PrDetail — confirm before discarding local AI comments
             // and re-running all agents.
             if app.screen == Screen::DoubleCheck || app.screen == Screen::PrDetail {
@@ -997,6 +1013,8 @@ async fn handle_action(
                 if app.diff_cursor >= app.diff_scroll + vh {
                     app.diff_scroll = app.diff_cursor.saturating_sub(vh - 1);
                 }
+            } else if app.screen == Screen::AiFixOutput {
+                app.ai_fix_scroll = app.ai_fix_scroll.saturating_add(3);
             }
         }
         Action::ScrollUp => {
@@ -1006,6 +1024,8 @@ async fn handle_action(
                 if app.diff_cursor < app.diff_scroll {
                     app.diff_scroll = app.diff_cursor;
                 }
+            } else if app.screen == Screen::AiFixOutput {
+                app.ai_fix_scroll = app.ai_fix_scroll.saturating_sub(3);
             }
         }
         Action::PageDown => {
@@ -1104,8 +1124,27 @@ async fn handle_action(
             }
         }
         Action::AiFix => {
-            if app.screen == Screen::DoubleCheck {
-                start_ai_fix(app, event_tx, config);
+            if app.screen == Screen::DoubleCheck || app.screen == Screen::AiFixOutput {
+                let current_pr_num = app.current_pr.as_ref().map(|p| p.number);
+                let cached_same_pr = app.fix_tasks_pr == current_pr_num
+                    && !app.fix_tasks.is_empty()
+                    && !app.ai_fix_loading;
+                if cached_same_pr && app.screen == Screen::DoubleCheck {
+                    // Reuse existing results — just navigate back
+                    app.navigate_to(Screen::AiFixOutput);
+                } else if app.screen == Screen::DoubleCheck {
+                    start_ai_fix(app, event_tx, config);
+                }
+            }
+        }
+        Action::ApplyFix => {
+            if app.screen == Screen::AiFixOutput {
+                apply_fix(app);
+            }
+        }
+        Action::CopyOutput => {
+            if app.screen == Screen::AiFixOutput {
+                copy_fix_output_to_clipboard(app);
             }
         }
         _ => {}
@@ -1668,8 +1707,9 @@ fn start_ai_fix(
             You are reviewing a code fix request.\n\
             File: {file} (line {line})\n\
             Issue [{severity}]: {body}\n\n\
-            Based on the diff below, suggest a concrete fix for this issue.\n\
-            Be specific — show the exact code change needed.\n\n\
+            Based on the diff below, provide the exact fix for this issue.\n\
+            Output the fix as a unified diff in a ```diff code block so it can be applied with `patch`.\n\
+            Then briefly explain what was changed and why.\n\n\
             ```diff\n{diff}\n```",
             diff = if diff.len() > 6000 { &diff[..6000] } else { &diff }
         );
@@ -1682,12 +1722,15 @@ fn start_ai_fix(
             status: FixTaskStatus::Pending,
             output: String::new(),
             prompt,
+            file_path: file.clone(),
         }
     }).collect();
 
     app.fix_task_selected = 0;
     app.ai_fix_scroll = 0;
     app.ai_fix_loading = true;
+    app.ai_fix_fullscreen = false;
+    app.fix_tasks_pr = app.current_pr.as_ref().map(|p| p.number);
     app.navigate_to(Screen::AiFixOutput);
 
     // Spawn one task per fix sequentially via channel
@@ -1697,8 +1740,9 @@ fn start_ai_fix(
 
     tokio::spawn(async move {
         let client = reqwest::Client::new();
-        let system = "You are a senior developer. Suggest a concise, specific fix for the reported code issue. \
-            Show the exact code change. Be brief and practical.";
+        let system = "You are a senior developer fixing code issues. \
+            Output the fix as a unified diff inside a ```diff code block (so it can be applied with `patch`). \
+            Then briefly explain the change. Be concise and practical.";
 
         for (idx, prompt) in tasks {
             let _ = tx.send(AppEvent::FixTaskChunk(idx, String::new())); // mark as Running
@@ -1722,6 +1766,146 @@ fn start_ai_fix(
             }
         }
     });
+}
+
+/// Extract the first ```diff...``` block from text, or fall back to the first fenced block.
+fn extract_diff_block(text: &str) -> Option<String> {
+    // Try ```diff first
+    if let Some(start) = text.find("```diff\n") {
+        let rest = &text[start + 8..];
+        if let Some(end) = rest.find("\n```") {
+            return Some(rest[..end].to_string());
+        }
+    }
+    // Fall back to any fenced block
+    if let Some(start) = text.find("```\n") {
+        let rest = &text[start + 4..];
+        if let Some(end) = rest.find("\n```") {
+            return Some(rest[..end].to_string());
+        }
+    }
+    None
+}
+
+/// Apply the diff from the selected fix task using the system `patch` command.
+/// Tries -p0, -p1, and -p2 strip levels to handle different diff header formats.
+fn apply_fix(app: &mut App) {
+    let task = match app.fix_tasks.get(app.fix_task_selected) {
+        Some(t) => t.clone(),
+        None => return,
+    };
+
+    if task.file_path.is_empty() {
+        app.show_info("Cannot apply fix", "No file path associated with this task.");
+        return;
+    }
+
+    let diff = match extract_diff_block(&task.output) {
+        Some(d) => d,
+        None => {
+            app.show_info(
+                "Cannot apply fix",
+                "No ```diff block found in the LLM output.\n\
+                 The model did not produce a unified diff.\n\
+                 Use [y] to copy the suggestion and apply it manually.",
+            );
+            return;
+        }
+    };
+
+    // Ensure the diff ends with a newline (patch requires it)
+    let diff = if diff.ends_with('\n') { diff } else { format!("{diff}\n") };
+
+    // Try strip levels 0, 1, 2 — LLMs use varying prefix styles
+    for strip in ["0", "1", "2"] {
+        let tmp = std::env::temp_dir().join(format!("prism_fix_{}.patch", task.index));
+        if std::fs::write(&tmp, diff.as_bytes()).is_err() {
+            continue;
+        }
+        let out = std::process::Command::new("patch")
+            .args([&format!("-p{strip}"), "--forward", "--batch", "--input"])
+            .arg(&tmp)
+            .output();
+        let _ = std::fs::remove_file(&tmp);
+
+        match out {
+            Ok(result) if result.status.success() => {
+                let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+                if let Some(t) = app.fix_tasks.get_mut(app.fix_task_selected) {
+                    t.output.push_str(&format!("\n\n✓ Fix applied (patch -p{strip}):\n{stdout}"));
+                }
+                app.show_info("Fix applied", &format!("patch -p{strip} succeeded:\n{stdout}"));
+                return;
+            }
+            _ => continue,
+        }
+    }
+
+    // All strip levels failed — show a diagnostic
+    // Run once more with -p1 to capture the real error message
+    let tmp = std::env::temp_dir().join(format!("prism_fix_{}_err.patch", task.index));
+    let _ = std::fs::write(&tmp, diff.as_bytes());
+    let err_out = std::process::Command::new("patch")
+        .args(["-p1", "--dry-run", "--input"])
+        .arg(&tmp)
+        .output();
+    let _ = std::fs::remove_file(&tmp);
+
+    let detail = err_out
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stderr).to_string();
+            if s.trim().is_empty() { String::from_utf8_lossy(&o.stdout).to_string() } else { s }
+        })
+        .unwrap_or_else(|e| e.to_string());
+
+    app.show_info(
+        "Apply failed",
+        &format!(
+            "Could not apply the diff automatically.\n\
+             patch error: {detail}\n\n\
+             Tip: Use [y] to copy the suggestion to clipboard\n\
+             and apply it manually in your editor."
+        ),
+    );
+}
+
+/// Copy the current task's output to the system clipboard (xclip / xsel).
+fn copy_fix_output_to_clipboard(app: &mut App) {
+    let output = match app.fix_tasks.get(app.fix_task_selected) {
+        Some(t) if !t.output.is_empty() => t.output.clone(),
+        _ => {
+            app.show_info("Nothing to copy", "The selected task has no output yet.");
+            return;
+        }
+    };
+
+    // Try xclip first, then xsel
+    let copied = try_copy_clipboard("xclip", &["-selection", "clipboard"], &output)
+        || try_copy_clipboard("xsel", &["--clipboard", "--input"], &output)
+        || try_copy_clipboard("wl-copy", &[], &output);
+
+    if copied {
+        app.show_info("Copied", "Fix output copied to clipboard.");
+    } else {
+        app.show_info(
+            "Copy failed",
+            "Could not find xclip, xsel, or wl-copy.\n\
+             Install one of them to enable clipboard support.",
+        );
+    }
+}
+
+fn try_copy_clipboard(cmd: &str, args: &[&str], text: &str) -> bool {
+    use std::io::Write;
+    let Ok(mut child) = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    else { return false; };
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
 fn init_tracing() -> Option<()> {

@@ -74,6 +74,8 @@ pub struct FixTask {
     pub status: FixTaskStatus,
     pub output: String,
     pub prompt: String,
+    /// Relative file path used for applying the fix (e.g. "src/foo.rs")
+    pub file_path: String,
 }
 
 /// Per-day usage bucket (stored as "YYYY-MM-DD" key in ModelStats.daily).
@@ -180,6 +182,10 @@ pub struct App {
     pub fix_task_selected: usize,
     pub ai_fix_scroll: usize,
     pub ai_fix_loading: bool,
+    /// PR number the current fix_tasks were generated for (to detect staleness)
+    pub fix_tasks_pr: Option<u64>,
+    /// Whether the output panel is shown fullscreen (task list hidden)
+    pub ai_fix_fullscreen: bool,
     pub setup_gh_token: String,
     pub setup_owner: String,
     pub setup_repo: String,
@@ -268,6 +274,8 @@ impl App {
             fix_task_selected: 0,
             ai_fix_scroll: 0,
             ai_fix_loading: false,
+            fix_tasks_pr: None,
+            ai_fix_fullscreen: false,
             setup_gh_token: String::new(),
             setup_owner: String::new(),
             setup_repo: String::new(),

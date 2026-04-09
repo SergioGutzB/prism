@@ -81,7 +81,31 @@ diff_exclude_patterns = [
 # the effective diff seen by the LLM is typically much smaller.
 max_diff_tokens = 12000
 
-# Review strictness: "critical_only" | "strict" | "moderate" | "light"
+# Review rigor level — controls how selective agents are when generating comments.
+#
+# Each level gives the LLM a concrete per-comment decision rule AND post-filters
+# the output as a safety net (in case the model ignores the instruction).
+#
+#   "critical_only"  — Security vulnerabilities, crashes, data loss, and build
+#                      failures ONLY. All other comments are dropped.
+#                      Post-filter: keeps only severity = "critical"
+#
+#   "strict"         — All of the above + significant architectural flaws,
+#                      missing error handling for realistic failure cases, critical
+#                      test gaps, and serious performance issues (N+1, memory leak).
+#                      Post-filter: keeps severity = "warning" and "critical"
+#
+#   "moderate"       — Balanced review (default). All genuine issues including
+#                      style, naming, and test suggestions.
+#                      Post-filter: none (all comments kept)
+#
+#   "light"          — Encouraging mode. Flags real problems, praises good patterns,
+#                      avoids nitpicking. Good for WIP or draft PRs.
+#                      Post-filter: none (all comments kept)
+#
+# Per-agent override: add  min_severity: "warning"  to any agent's .md frontmatter
+# to pin that agent's minimum severity regardless of this global setting.
+# Example: set security agent to always keep "suggestion" even in strict mode.
 review_rigor = "moderate"
 
 [ui]
