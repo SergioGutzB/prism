@@ -1,6 +1,6 @@
 pub mod agent_config;
 pub mod agent_wizard;
-pub mod claude_output;
+pub mod ai_fix_output;
 pub mod setup;
 pub mod agent_runner;
 pub mod double_check;

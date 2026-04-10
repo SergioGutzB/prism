@@ -23,7 +23,7 @@ pub enum Screen {
     AgentConfig,
     AgentWizard,
     Settings,
-    ClaudeCodeOutput,
+    AiFixOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +74,8 @@ pub struct FixTask {
     pub status: FixTaskStatus,
     pub output: String,
     pub prompt: String,
+    /// Relative file path used for applying the fix (e.g. "src/foo.rs")
+    pub file_path: String,
 }
 
 /// Per-day usage bucket (stored as "YYYY-MM-DD" key in ModelStats.daily).
@@ -165,6 +167,8 @@ pub struct App {
     pub agents_committed: bool,
     pub show_help: bool,
     pub show_stats: bool,
+    /// True while the LLM is generating the review body in SummaryPreview.
+    pub review_body_generating: bool,
 
     // Statistics
     pub stats_range: u8,   // 0 = last 7d, 1 = last 15d, 2 = last 30d, 3 = all time
@@ -176,8 +180,12 @@ pub struct App {
     pub editing_comment_id: Option<uuid::Uuid>,
     pub fix_tasks: Vec<FixTask>,
     pub fix_task_selected: usize,
-    pub claude_output_scroll: usize,
-    pub claude_output_loading: bool,
+    pub ai_fix_scroll: usize,
+    pub ai_fix_loading: bool,
+    /// PR number the current fix_tasks were generated for (to detect staleness)
+    pub fix_tasks_pr: Option<u64>,
+    /// Whether the output panel is shown fullscreen (task list hidden)
+    pub ai_fix_fullscreen: bool,
     pub setup_gh_token: String,
     pub setup_owner: String,
     pub setup_repo: String,
@@ -257,14 +265,17 @@ impl App {
             agents_committed: false,
             show_help: false,
             show_stats: false,
+            review_body_generating: false,
             stats_range: 3,
             model_stats: HashMap::new(),
             pending_delete_comment: None,
             editing_comment_id: None,
             fix_tasks: Vec::new(),
             fix_task_selected: 0,
-            claude_output_scroll: 0,
-            claude_output_loading: false,
+            ai_fix_scroll: 0,
+            ai_fix_loading: false,
+            fix_tasks_pr: None,
+            ai_fix_fullscreen: false,
             setup_gh_token: String::new(),
             setup_owner: String::new(),
             setup_repo: String::new(),

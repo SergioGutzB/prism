@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::app::App;
 use crate::ui::screens::{
-    agent_config, agent_runner, agent_wizard, claude_output, double_check, file_tree, pr_detail, pr_list,
+    agent_config, agent_runner, agent_wizard, ai_fix_output, double_check, file_tree, pr_detail, pr_list,
     review_compose, setup, summary_preview,
 };
 
@@ -25,7 +25,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         crate::app::Screen::AgentConfig => agent_config::render(frame, app),
         crate::app::Screen::AgentWizard => agent_wizard::render(frame, app),
         crate::app::Screen::Settings => render_settings(frame, app),
-        crate::app::Screen::ClaudeCodeOutput => claude_output::render(frame, app),
+        crate::app::Screen::AiFixOutput => ai_fix_output::render(frame, app),
     }
 
     // Overlay popup on top of everything

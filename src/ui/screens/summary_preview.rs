@@ -21,11 +21,19 @@ pub fn render(frame: &mut Frame, app: &App) {
         area,
     );
 
+    let pane_hint = if app.summary_pane == 0 { ("[Tab]", "→ Comments") } else { ("[Tab]", "→ Body") };
+    let generate_hint = if app.review_body_generating { ("[g]", "Generating…") } else { ("[g]", "Generate body") };
+    let bar_hints: &[(&str, &str)] = &[
+        ("[Esc]", "Back"), ("[←→]", "Review type"), pane_hint,
+        ("[jk]", "Scroll"), generate_hint, ("[Enter/p]", "Submit"),
+    ];
+    let bar_h = keybind_bar::height_for(bar_hints, area.width);
+
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
         Constraint::Length(5), // review event selector
-        Constraint::Length(3),
+        Constraint::Length(bar_h),
     ])
     .split(area);
 
@@ -41,25 +49,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_comment_list(frame, app, body_chunks[1], &t);
     render_event_selector(frame, app, chunks[2], &t);
 
-    let pane_hint = if app.summary_pane == 0 {
-        ("[Tab]", "→ Comments")
-    } else {
-        ("[Tab]", "→ Body")
-    };
-
-    keybind_bar::render(
-        frame,
-        chunks[3],
-        &[
-            ("[Esc]", "Back"),
-            ("[←→]", "Review type"),
-            pane_hint,
-            ("[jk]", "Scroll"),
-            ("[g]", "Generate body"),
-            ("[Enter/p]", "Submit"),
-        ],
-        &t,
-    );
+    keybind_bar::render(frame, chunks[3], bar_hints, &t);
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
@@ -85,11 +75,16 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let focused = app.summary_pane == 0;
     let border_color = if focused { t.border_focused } else { t.border };
 
-    let body = app
-        .draft
-        .as_ref()
-        .and_then(|d| d.review_body.as_deref())
-        .unwrap_or("(Empty — press [g] to auto-generate from approved comments, or leave blank to submit only inline comments.)");
+    let generating_str;
+    let body = if app.review_body_generating {
+        generating_str = format!("{}  Generating review body with LLM…", app.spinner_char());
+        &generating_str as &str
+    } else {
+        app.draft
+            .as_ref()
+            .and_then(|d| d.review_body.as_deref())
+            .unwrap_or("(Empty — press [g] to auto-generate from approved comments, or leave blank to submit only inline comments.)")
+    };
 
     let total_lines = body.lines().count().max(1);
     let scroll = app.summary_body_scroll;

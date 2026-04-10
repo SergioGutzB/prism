@@ -25,25 +25,34 @@ key_patterns = ["[a-z]+-[0-9]+"]
 #   "openai"      OpenAI Chat Completions → set OPENAI_API_KEY
 #   "gemini"      Google Gemini API       → set GEMINI_API_KEY or GOOGLE_API_KEY
 #   "ollama"      Local Ollama server     → no key needed (default: localhost:11434)
-provider = "claude-cli"
+# provider = "claude-cli"
 # provider = "gemini"
+provider = "ollama"
 
 # Model name for the selected provider, e.g.:
 #   anthropic : "claude-opus-4-6" | "claude-sonnet-4-6" | "claude-haiku-4-5"
 #   openai    : "gpt-4o" | "gpt-4-turbo" | "o3"
 #   gemini    : "gemini-1.5-pro" | "gemini-1.5-flash" | "gemini-2.0-flash" | "gemini-flash-latest"
 # ollama    : "llama3.2" | "codellama" | "deepseek-coder"
-model = "claude-opus-4-6"
+# model = "claude-opus-4-6"
 # model    = "gemini-flash-latest"
+model = "qwen2.5-coder:14b"
+
+#
 max_tokens = 8192
 temperature = 0.2
 # api_key = ""     # overrides env var; leave empty to use ANTHROPIC_API_KEY etc.
 # base_url = ""    # custom endpoint (Azure OpenAI, custom Ollama host, etc.)
+# ollama_num_ctx = 16384  # Ollama context window (tokens). Set this if you see
+#                         # "truncating input prompt" in the Ollama server log.
+#                         # Must be <= the model's n_ctx_train (shown in Ollama logs).
+#                         # Recommended for qwen2.5-coder:14b: 16384 or 32768.
+ollama_num_ctx = 16384
 
 [agents]
 agents_dir = "~/.config/prism/agents"
-concurrency = 2
-timeout_secs = 300
+concurrency = 1
+timeout_secs = 600
 
 # Files matching these glob patterns are excluded from every agent's diff.
 # Patterns are matched against the full path and every sub-path (so "dist/*"
@@ -72,7 +81,31 @@ diff_exclude_patterns = [
 # the effective diff seen by the LLM is typically much smaller.
 max_diff_tokens = 12000
 
-# Review strictness: "critical_only" | "strict" | "moderate" | "light"
+# Review rigor level — controls how selective agents are when generating comments.
+#
+# Each level gives the LLM a concrete per-comment decision rule AND post-filters
+# the output as a safety net (in case the model ignores the instruction).
+#
+#   "critical_only"  — Security vulnerabilities, crashes, data loss, and build
+#                      failures ONLY. All other comments are dropped.
+#                      Post-filter: keeps only severity = "critical"
+#
+#   "strict"         — All of the above + significant architectural flaws,
+#                      missing error handling for realistic failure cases, critical
+#                      test gaps, and serious performance issues (N+1, memory leak).
+#                      Post-filter: keeps severity = "warning" and "critical"
+#
+#   "moderate"       — Balanced review (default). All genuine issues including
+#                      style, naming, and test suggestions.
+#                      Post-filter: none (all comments kept)
+#
+#   "light"          — Encouraging mode. Flags real problems, praises good patterns,
+#                      avoids nitpicking. Good for WIP or draft PRs.
+#                      Post-filter: none (all comments kept)
+#
+# Per-agent override: add  min_severity: "warning"  to any agent's .md frontmatter
+# to pin that agent's minimum severity regardless of this global setting.
+# Example: set security agent to always keep "suggestion" even in strict mode.
 review_rigor = "moderate"
 
 [ui]
