@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::review::models::GeneratedComment;
+use crate::review::models::{GeneratedComment, Severity};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDefinition {
@@ -27,6 +27,27 @@ pub struct AgentMeta {
     /// findings as additional context. Use for synthesis/summary agents. Default: false.
     #[serde(default)]
     pub synthesis: bool,
+    /// Per-agent minimum severity override. When set, comments below this
+    /// severity are discarded regardless of the global `review_rigor` setting.
+    /// Accepts: "praise" | "suggestion" | "warning" | "critical"
+    /// Useful for agents like `security` that should always surface suggestions
+    /// even when the global rigor is set to `strict` or `critical_only`.
+    #[serde(default)]
+    pub min_severity: Option<String>,
+}
+
+impl AgentMeta {
+    /// Resolve the effective minimum severity for this agent.
+    ///
+    /// Priority: agent-level `min_severity` > global `global_min`.
+    /// Returns `None` if no filtering should be applied (keep all comments).
+    pub fn effective_min_severity(&self, global_min: Option<&Severity>) -> Option<Severity> {
+        if let Some(s) = &self.min_severity {
+            s.parse::<Severity>().ok()
+        } else {
+            global_min.cloned()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

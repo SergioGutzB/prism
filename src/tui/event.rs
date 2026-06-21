@@ -44,6 +44,10 @@ pub enum AppEvent {
     CommentUpdated(uuid::Uuid, String),
     /// Fetched project conventions (CONTRIBUTING.md / PR template) for the current repo.
     ConventionsLoaded(Option<String>),
+    /// LLM-generated review body text (from [g] in SummaryPreview).
+    ReviewBodyGenerated(String),
+    /// Review body generation failed.
+    ReviewBodyFailed(String),
 }
 
 /// Spawn a background thread that polls crossterm key events.

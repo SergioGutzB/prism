@@ -22,8 +22,11 @@ impl ReviewPublisher {
             warn!("No submittable comments — submitting empty review body only");
         }
 
+        // Skip comments that already exist on GitHub (github_id is set) — re-posting
+        // them would create duplicates. Only new, locally-generated comments are submitted.
         let inline_comments: Vec<crate::github::models::ReviewComment> = approved
             .iter()
+            .filter(|c| c.github_id.is_none())
             .filter_map(|c| {
                 let path = c.file_path.as_ref()?;
                 let line = c.line?;

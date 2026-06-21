@@ -26,13 +26,45 @@ struct RawSummary {
 }
 
 /// Objective-validator agent (Phase 0) returns this shape.
+/// Local models (Ollama) sometimes return `stated_objectives` / `implementation_summary`
+/// as arrays instead of strings — `string_or_array` joins them with "; ".
 #[derive(Debug, Deserialize)]
 struct RawObjective {
+    #[serde(deserialize_with = "string_or_array")]
     stated_objectives: String,
+    #[serde(deserialize_with = "string_or_array")]
     implementation_summary: String,
     alignment: String,
     gaps: Option<Vec<String>>,
+    #[serde(deserialize_with = "string_or_array")]
     overall_assessment: String,
+}
+
+/// Deserialize a JSON field that may be either a plain string or an array of strings.
+/// Arrays are joined with "; ".
+fn string_or_array<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    use serde::de::{self, Visitor};
+    struct StrOrArr;
+    impl<'de> Visitor<'de> for StrOrArr {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a string or array of strings")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<String, E> {
+            Ok(v)
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<String, A::Error> {
+            let mut parts = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                parts.push(s);
+            }
+            Ok(parts.join("; "))
+        }
+    }
+    d.deserialize_any(StrOrArr)
 }
 
 pub struct AgentRunner {
@@ -89,9 +121,32 @@ impl AgentRunner {
         let input_tokens = ((system_len + prompt.len()) / 4) as u64;
         let output_tokens = (raw_response.len() / 4) as u64;
 
-        let json_str = extract_json(strip_markdown_fences(&raw_response));
-        let raw: RawObjective = serde_json::from_str(json_str)
-            .context("Failed to parse objective analysis JSON")?;
+        let json_str = clean_llm_response(&raw_response);
+        let raw: RawObjective = match serde_json::from_str(&json_str) {
+            Ok(r) => r,
+            Err(e) => {
+                // JSON parse failed — local models (Ollama) often truncate or mis-format.
+                // Log the raw response for debugging, then return a degraded result
+                // so the other agents can still run with a neutral ObjectiveAnalysis.
+                warn!(
+                    agent_id = %agent.agent.id,
+                    error = %e,
+                    raw_len = raw_response.len(),
+                    raw_preview = %&raw_response.chars().take(200).collect::<String>(),
+                    "Objective JSON parse failed — using degraded fallback"
+                );
+                RawObjective {
+                    stated_objectives: "Could not parse objectives (JSON parse error)".into(),
+                    implementation_summary: raw_response.chars().take(500).collect(),
+                    alignment: "partial".into(),
+                    gaps: None,
+                    overall_assessment: format!(
+                        "Objective Validator could not parse the model response as JSON ({e}). \
+                        Review the diff manually for objective alignment."
+                    ),
+                }
+            }
+        };
 
         let alignment = match raw.alignment.to_lowercase().trim() {
             "aligned"    => ObjectiveAlignment::Aligned,
@@ -159,20 +214,79 @@ impl AgentRunner {
         let output_tokens = (raw_response.len() / 4) as u64;
 
         match self.parse_response(agent, &raw_response) {
-            Ok(comments) => Ok((comments, input_tokens, output_tokens)),
+            Ok(comments) => {
+                let filtered = self.apply_severity_filter(agent, comments);
+                Ok((filtered, input_tokens, output_tokens))
+            }
             Err(parse_err) => {
                 warn!(agent_id = %agent.agent.id, "First parse attempt failed ({}), retrying", parse_err);
+                // Include the expected schema in the retry to help models that drifted
+                let schema_hint = if agent.agent.id == "objective" {
+                    r#"Respond ONLY with this exact JSON object (no prose, no fences, no <think> blocks):
+{"stated_objectives":"...","implementation_summary":"...","alignment":"aligned|partial|misaligned","gaps":[],"overall_assessment":"..."}"#
+                } else if agent.agent.id == "summary" {
+                    r#"Respond ONLY with this exact JSON object (no prose, no fences, no <think> blocks):
+{"body":"...","severity":"suggestion|warning|critical|praise"}"#
+                } else {
+                    r#"Respond ONLY with a JSON array (no prose, no fences, no <think> blocks):
+[{"file_path":"path/to/file.rs","line":42,"severity":"suggestion|warning|critical|praise","body":"comment text"}]
+Use null for file_path and line when the comment is general."#
+                };
                 let retry_prompt = format!(
-                    "{}\n\nYour previous response could not be parsed as JSON. \
-                     Please respond ONLY with valid JSON, no markdown fences.",
-                    prompt
+                    "{}\n\n---\nYour previous response could not be parsed as JSON (error: {}).\n{}",
+                    prompt, parse_err, schema_hint
                 );
                 let retry_response = self.call_llm(agent, &retry_prompt).await?;
                 let retry_in = (retry_prompt.len() / 4) as u64;
                 let retry_out = (retry_response.len() / 4) as u64;
                 let comments = self.parse_response(agent, &retry_response)
                     .context("JSON parse failed after retry")?;
-                Ok((comments, input_tokens + retry_in, output_tokens + retry_out))
+                let filtered = self.apply_severity_filter(agent, comments);
+                Ok((filtered, input_tokens + retry_in, output_tokens + retry_out))
+            }
+        }
+    }
+
+    /// Post-generation safety net: discard comments that fall below the effective
+    /// minimum severity for this agent. The LLM rigor instruction is the primary
+    /// gate; this filter catches the cases where the model ignores it.
+    ///
+    /// The effective threshold is resolved as:
+    ///   agent `min_severity` (frontmatter) > global `review_rigor` > no filter
+    ///
+    /// Summary and objective agents are exempt — their comments carry structural
+    /// meaning (overall verdict) that should never be filtered by rigor level.
+    fn apply_severity_filter(
+        &self,
+        agent: &AgentDefinition,
+        comments: Vec<GeneratedComment>,
+    ) -> Vec<GeneratedComment> {
+        // Exempt structural agents from severity filtering
+        if matches!(agent.agent.id.as_str(), "summary" | "objective") {
+            return comments;
+        }
+
+        let global_min = self.config.agents.min_severity_for_rigor();
+        let min = agent.agent.effective_min_severity(global_min.as_ref());
+
+        match min {
+            None => comments,
+            Some(threshold) => {
+                let before = comments.len();
+                let filtered: Vec<_> = comments
+                    .into_iter()
+                    .filter(|c| c.severity >= threshold)
+                    .collect();
+                let dropped = before - filtered.len();
+                if dropped > 0 {
+                    debug!(
+                        agent_id = %agent.agent.id,
+                        dropped,
+                        threshold = %threshold,
+                        "Rigor filter dropped comments below severity threshold",
+                    );
+                }
+                filtered
             }
         }
     }
@@ -266,18 +380,24 @@ impl AgentRunner {
 
             parts.push(diff_section);
         }
+
+        // Inject the rigor instruction immediately before the prompt suffix so the
+        // model reads it as the last constraint before generating output — the most
+        // influential position. Agents with `min_severity` set in their frontmatter
+        // skip the global rigor instruction; the post-generation filter still applies.
+        if agent.agent.min_severity.is_none() {
+            if let Some(instruction) = self.config.agents.rigor_instruction() {
+                parts.push(instruction.to_string());
+            }
+        }
+
         parts.push(agent.agent.prompt.prompt_suffix.clone());
         parts.join("\n\n")
     }
 
     /// Dispatch to the right LLM backend based on `config.llm.provider`.
     async fn call_llm(&self, agent: &AgentDefinition, prompt: &str) -> Result<String> {
-        let rigor_prefix = self.config.agents.rigor_prefix();
-        let system = if rigor_prefix.is_empty() {
-            agent.agent.prompt.system.clone()
-        } else {
-            format!("{}{}", rigor_prefix, agent.agent.prompt.system)
-        };
+        let system = agent.agent.prompt.system.clone();
 
         // Per-agent model/temperature override (if defined in agent YAML)
         let model = agent.agent.llm.as_ref()
@@ -307,10 +427,10 @@ impl AgentRunner {
     }
 
     fn parse_response(&self, agent: &AgentDefinition, response: &str) -> Result<Vec<GeneratedComment>> {
-        let json_str = extract_json(strip_markdown_fences(response));
+        let json_str = clean_llm_response(response);
 
         if agent.agent.id == "summary" {
-            let raw: RawSummary = serde_json::from_str(json_str)
+            let raw: RawSummary = serde_json::from_str(&json_str)
                 .context("Failed to parse summary JSON")?;
             let comment = GeneratedComment::new(
                 CommentSource::Agent {
@@ -325,7 +445,7 @@ impl AgentRunner {
             );
             Ok(vec![comment])
         } else {
-            let raw_comments: Vec<RawComment> = serde_json::from_str(json_str)
+            let raw_comments: Vec<RawComment> = serde_json::from_str(&json_str)
                 .context("Failed to parse comments JSON array")?;
             Ok(raw_comments
                 .into_iter()
@@ -638,6 +758,17 @@ async fn call_ollama(
     let base = llm.effective_base_url();
     let url = format!("{}/api/chat", base);
 
+    // Build options — always set temperature and output budget.
+    // If ollama_num_ctx > 0, request that context window explicitly so Ollama
+    // doesn't silently truncate long prompts (e.g. "truncating input prompt" in logs).
+    let mut options = serde_json::json!({
+        "temperature": temperature,
+        "num_predict": max_tokens,
+    });
+    if llm.ollama_num_ctx > 0 {
+        options["num_ctx"] = serde_json::json!(llm.ollama_num_ctx);
+    }
+
     let body = serde_json::json!({
         "model": model,
         "stream": false,
@@ -645,10 +776,7 @@ async fn call_ollama(
             {"role": "system",  "content": system},
             {"role": "user",    "content": prompt}
         ],
-        "options": {
-            "temperature": temperature,
-            "num_predict": max_tokens
-        }
+        "options": options
     });
 
     debug!("POST Ollama /api/chat model={}", model);
@@ -707,6 +835,82 @@ fn strip_markdown_fences(s: &str) -> &str {
     s.trim()
 }
 
+/// Strip `<think>…</think>` blocks emitted by reasoning models (Qwen, DeepSeek, etc.)
+/// before the actual response. Returns a slice starting after the last closing tag,
+/// or the original string if no such tags are found.
+fn strip_thinking_blocks(s: &str) -> &str {
+    // Tags used by various models: <think>, <|thinking|>, <reasoning>, <internal>
+    const CLOSE_TAGS: &[&str] = &["</think>", "</|thinking|>", "</reasoning>", "</internal>"];
+    let mut best_end = 0usize;
+    for tag in CLOSE_TAGS {
+        if let Some(pos) = s.rfind(tag) {
+            let end = pos + tag.len();
+            if end > best_end {
+                best_end = end;
+            }
+        }
+    }
+    if best_end > 0 {
+        s[best_end..].trim()
+    } else {
+        s
+    }
+}
+
+/// Remove trailing commas before `}` or `]` — common in LLM-generated JSON.
+/// Also attempts to close truncated arrays/objects by counting unclosed brackets.
+fn repair_json(s: &str) -> std::borrow::Cow<'_, str> {
+    // Fast path: if it already parses, don't touch it
+    if serde_json::from_str::<serde_json::Value>(s).is_ok() {
+        return std::borrow::Cow::Borrowed(s);
+    }
+
+    // Remove trailing commas before closing bracket/brace
+    let mut result = String::with_capacity(s.len() + 8);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for a comma followed only by whitespace then } or ]
+        if bytes[i] == b',' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r') {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
+                i += 1; // skip the comma
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+
+    // If the JSON is truncated, try to close open brackets/braces
+    let mut depth_obj: i32 = 0;
+    let mut depth_arr: i32 = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    for ch in result.chars() {
+        if escape_next { escape_next = false; continue; }
+        if ch == '\\' && in_string { escape_next = true; continue; }
+        if ch == '"' { in_string = !in_string; continue; }
+        if in_string { continue; }
+        match ch {
+            '{' => depth_obj += 1,
+            '}' => depth_obj -= 1,
+            '[' => depth_arr += 1,
+            ']' => depth_arr -= 1,
+            _ => {}
+        }
+    }
+    // Close any unclosed string first, then brackets
+    if in_string { result.push('"'); }
+    for _ in 0..depth_arr.max(0) { result.push(']'); }
+    for _ in 0..depth_obj.max(0) { result.push('}'); }
+
+    std::borrow::Cow::Owned(result)
+}
+
 /// After stripping fences, find the first `{` or `[` and last `}` or `]` to extract
 /// valid JSON even when the LLM prepends preamble text before the JSON object.
 fn extract_json(s: &str) -> &str {
@@ -723,6 +927,15 @@ fn extract_json(s: &str) -> &str {
         (Some(i), Some(j)) if j > i => &s[i..=j],
         _ => s,
     }
+}
+
+/// Full pipeline: strip thinking blocks → strip fences → extract JSON bounds → repair.
+/// Returns an owned String so callers can pass it to serde_json.
+fn clean_llm_response(raw: &str) -> String {
+    let s = strip_thinking_blocks(raw);
+    let s = strip_markdown_fences(s);
+    let s = extract_json(s);
+    repair_json(s).into_owned()
 }
 
 fn parse_severity(s: Option<&str>) -> Severity {

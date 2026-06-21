@@ -79,29 +79,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         area,
     );
 
-    let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(0),
-        Constraint::Length(3),
-    ])
-    .split(area);
-
-    render_header(frame, app, chunks[0], &t);
-
-    // Compute threaded list once per frame and pass it to sub-renderers.
-    // Previously threaded_comments() was called 4x per frame (render_comment_list,
-    // render_detail x2, visible_comment_count). Now it runs exactly once.
+    // Build hints first so we can compute the keybind bar height before layout.
     let threaded = threaded_comments(app);
-
-    // Split body: list (40%) | detail (60%)
-    let body_chunks = Layout::horizontal([
-        Constraint::Percentage(40),
-        Constraint::Percentage(60),
-    ])
-    .split(chunks[1]);
-
-    render_comment_list(frame, app, body_chunks[0], &t, &threaded);
-    render_detail(frame, app, body_chunks[1], &t, &threaded);
 
     let pane_hint = if app.double_check_pane == 0 {
         ("[Tab]", "→ Detail")
@@ -111,28 +90,54 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let fix_label = format!("Fix with {}", app.config.llm.provider);
 
-    keybind_bar::render(
-        frame,
-        chunks[2],
-        &[
-            ("[Esc]", "Back"),
-            ("[jk]", "Nav"),
-            ("[Space]", "Toggle"),
-            pane_hint,
-            ("[c]", "New comment"),
-            ("[g]", "Edit comment"),
-            ("[A]", "Approve all"),
-            ("[D]", "Reject all"),
-            ("[Del]", "Delete"),
-            ("[P]", "Preview"),
-            ("[r]", "Run missing"),
-            ("[R]", "Restart"),
-            ("[F]", &fix_label),
-            ("[1-7]", "Filter agent"),
-            ("[?]", "Help"),
-        ],
-        &t,
-    );
+    let selected_is_github = threaded
+        .get(app.double_check_selected)
+        .map(|(_, c, _)| c.github_id.is_some())
+        .unwrap_or(false);
+
+    let mut hints: Vec<(&str, &str)> = vec![
+        ("[Esc]", "Back"),
+        ("[jk]", "Nav"),
+        pane_hint,
+        ("[c]", "New comment"),
+        ("[P]", "Preview"),
+    ];
+    if selected_is_github {
+        hints.push(("[Del/-]", "Delete from GitHub"));
+    } else {
+        hints.push(("[Space]", "Toggle ○/✓/✗"));
+        hints.push(("[g]", "Edit"));
+        hints.push(("[Del/-]", "Remove"));
+        hints.push(("[A]", "Approve all new"));
+        hints.push(("[D]", "Reject all new"));
+    }
+    hints.push(("[r]", "Run missing"));
+    hints.push(("[R]", "Restart"));
+    hints.push(("[F]", &fix_label));
+    hints.push(("[1-7]", "Filter agent"));
+    hints.push(("[?]", "Help"));
+
+    let bar_h = keybind_bar::height_for(&hints, area.width);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(bar_h),
+    ])
+    .split(area);
+
+    render_header(frame, app, chunks[0], &t);
+
+    let body_chunks = Layout::horizontal([
+        Constraint::Percentage(40),
+        Constraint::Percentage(60),
+    ])
+    .split(chunks[1]);
+
+    render_comment_list(frame, app, body_chunks[0], &t, &threaded);
+    render_detail(frame, app, body_chunks[1], &t, &threaded);
+
+    keybind_bar::render(frame, chunks[2], &hints, &t);
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
@@ -327,10 +332,16 @@ fn render_comment_list<'a>(
             let selected = visual_i == app.double_check_selected;
             let is_reply = *depth > 0;
 
-            let status_icon = match comment.status {
-                CommentStatus::Approved => Span::styled("✓ ", Style::default().fg(t.agent_done)),
-                CommentStatus::Rejected => Span::styled("✗ ", Style::default().fg(t.agent_failed)),
-                CommentStatus::Pending  => Span::styled("○ ", Style::default().fg(t.muted)),
+            // Already-published GitHub comments get a fixed "● github" badge —
+            // they have no local publish/reject cycle. Local comments use ○/✓/✗.
+            let status_icon = if comment.github_id.is_some() {
+                Span::styled("● ", Style::default().fg(t.loading))
+            } else {
+                match comment.status {
+                    CommentStatus::Approved => Span::styled("✓ ", Style::default().fg(t.agent_done)),
+                    CommentStatus::Rejected => Span::styled("✗ ", Style::default().fg(t.agent_failed)),
+                    CommentStatus::Pending  => Span::styled("○ ", Style::default().fg(t.muted)),
+                }
             };
 
             let sev_color = match comment.severity {
@@ -466,10 +477,15 @@ fn render_detail<'a>(
         Severity::Praise => t.praise,
     };
 
-    let status_label = match comment.status {
-        CommentStatus::Approved => (" ✓ APPROVED ", t.agent_done),
-        CommentStatus::Rejected => (" ✗ REJECTED ", t.agent_failed),
-        CommentStatus::Pending  => (" ○ PENDING  ", t.muted),
+    // GitHub comments show a "● ON GITHUB" badge — not part of the local publish cycle.
+    let status_label = if comment.github_id.is_some() {
+        (" ● ON GITHUB ", t.loading)
+    } else {
+        match comment.status {
+            CommentStatus::Approved => (" ✓ APPROVED ", t.agent_done),
+            CommentStatus::Rejected => (" ✗ REJECTED ", t.agent_failed),
+            CommentStatus::Pending  => (" ○ PENDING  ", t.muted),
+        }
     };
 
     let source_line = match &comment.source {
@@ -647,9 +663,14 @@ fn render_detail<'a>(
         lines.push(Line::from(divider.clone()));
     }
 
-    // Add hint at bottom
+    // Context-sensitive hint: GitHub comments can only be deleted, not toggled.
+    let hint = if comment.github_id.is_some() {
+        "[Del/-] Delete from GitHub   [Tab] back to list"
+    } else {
+        "[Space] toggle ○/✓/✗   [g] Edit   [Del/-] Remove   [Tab] back to list"
+    };
     lines.push(Line::from(Span::styled(
-        "[Space] toggle status   [Tab] back to list",
+        hint,
         Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
     )));
 

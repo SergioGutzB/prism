@@ -25,6 +25,14 @@ context:
   # Leave empty to review all source files.
   # Example: ["*.py", "*.js", "*.ts"] to focus on specific languages.
   include_patterns: []
+
+# Per-agent minimum severity override.
+# Overrides the global review_rigor post-filter for this agent only.
+# The security agent keeps "suggestion"-level findings even in strict/critical_only
+# mode because security suggestions (e.g. "prefer constant-time comparison") can
+# prevent vulnerabilities before they escalate.
+# Uncomment to activate:
+# min_severity: "suggestion"
 ---
 
 ## System Prompt
